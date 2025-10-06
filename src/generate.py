@@ -60,7 +60,7 @@ tri_lag[:5] = tri_lag[5]           # fix the first 5 entries (so they don’t wr
 # Add in the lag
 y_base = 1.2*s + 0.5*(s*tri_lag) + 0.6*(q*tri) + 0.3*(tri**2)
 
-# NOTE: If we just left y base as is, target is stationary (same non-linear formula applies), but now the strenght of the relationship changes throughout time...abs
+# NOTE: If we just left y base as is, target is stationary (same non-linear formula applies), but now the strength of the relationship changes throughout time...abs
 # making it harder for the LSTM to match
 env = 1.0 + 0.4 * np.sin(2 * np.pi * 0.2 * t)
 

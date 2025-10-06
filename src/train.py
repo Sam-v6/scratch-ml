@@ -312,10 +312,10 @@ def run_HPO(data_ref, seed):
     params=lstm_params
 
     # Async Successive Halfing Scheduler (ASHA)
-    # Instead of running all trials for all epochs, it allocates more resources to promising ones and kills of bad ones early
+    # Instead of running all trials for all epochs, it allocates more resources to promising ones and kills of bad ones early, these trials are pruned after grace period according to our reduction factor
     scheduler = ASHAScheduler(
         max_t=params["epochs"],                     # Max amount of "things" on our whatever our scale is (since we call tune.report once per epoch this max epochs per trial)
-        grace_period=params["checkpoint_freq"]+1,   # Allow for 51 epochs each trial until we kill it
+        grace_period=params["checkpoint_freq"]+1,   # Allow for x epochs each trial until we kill it
         reduction_factor=2,                         # ASHA keeps about 50% of the top trials each time it prunes
     )
     
@@ -324,7 +324,7 @@ def run_HPO(data_ref, seed):
     ######################################################################
     trainable = tune.with_parameters(train_trial, data_ref=data_ref, base_seed=base_seed)  # Allows each training run to get training data from shared object store and random seed
     tuner = Tuner(
-        tune.with_resources(trainable, resources={"cpu": 4, "gpu": 1}),                  # Gives 4 CPU and one GPU per trial
+        tune.with_resources(trainable, resources={"cpu": 4, "gpu": 1}),  # Gives 4 CPU and one GPU per trial, GPU will bottlekecki trials here at 8, fractional GPU is possible for inference or if we manage mem explicitly which sounds like a nightmare
         param_space=params,
         tune_config=TuneConfig( 
             metric="val_rmse",
