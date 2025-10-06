@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=61.0"] # Or another build backend like "hatchling" or "flit_core"
+build-backend = "setuptools.build_meta" # Corresponds to the chosen build backend
+
+[project]
+name = "scratch-ml"
+version = "0.1.0"
+description = "Sandbox environment for experimenting with time series modeling and Ray Train/Tune, MLflow, and ONNX integration."
+authors = [
+    { name = "Syam Evani", email = "syamevani@gmail.com" },
+]
+license = { text = "MIT" } # Or a more specific license like { file = "LICENSE" }
+readme = "README.md"
+requires-python = ">=3.12" # Specify compatible Python versions
+dependencies = [
+    "ipykernel>=6.30.1",
+    "jupyter>=1.1.1",
+    "matplotlib>=3.10.6",
+    "mlflow>=3.4.0",
+    "numpy>=2.3.3",
+    "pandas>=2.3.2",
+    "pip-tools>=7.5.0",
+    "ray[default,train,tune]>=2.49.2",
+    "scikit-learn>=1.7.2",
+    "scipy>=1.16.2",
+    "tensorboard>=2.20.0",
+    "torch>=2.8.0",
+]
+
+[tool.uv.workspace]
+members = [
+    "something",
+]
+
+[tool.setuptools.packages.find]
+where = []
+
+# [project.urls]
+# Homepage = "https://github.com/your-username/your-package-name"
+# Repository = "https://github.com/your-username/your-package-name"
+# Documentation = "https://your-package-name.readthedocs.io/"
+
+# [project.optional-dependencies]
+# dev = [
+#     "pytest",
+#     "black",
+#     "mypy",
+# ]
+# docs = [
+#     "sphinx",
+#     "sphinx-rtd-theme",
+# ]
+
+# Example for a specific tool configuration (Black formatter)
+# [tool.black]
+# line-length = 88
+# target-version = ['py38', 'py39', 'py310', 'py311', 'py312']
