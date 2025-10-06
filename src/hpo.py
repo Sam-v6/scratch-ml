@@ -18,7 +18,7 @@ import joblib # Save pkl
 # Ray Tune
 import ray
 from ray import train, tune, air
-from ray.air.integrations.mlflow import MLflowLoggerCallback, setup_mlflow
+from ray.air.integrations.mlflow import MLflowLoggerCallback
 from ray.train import Checkpoint
 from ray.tune import Tuner, RunConfig, TuneConfig, FailureConfig
 from ray.tune.schedulers import ASHAScheduler
@@ -198,6 +198,8 @@ def run_HPO(data_ref, seed):
     best = results.get_best_result(metric="val_rmse", mode="min")
     print("Best config:", best.config)
 
+    return best
+
 if __name__ == "__main__":
 
     # TODO: https://docs.ray.io/en/latest/train/user-guides/hyperparameter-optimization.html#train-tune
@@ -214,4 +216,6 @@ if __name__ == "__main__":
     data_ref = ray.put((x_train, y_train, x_val, y_val, scaler))              # Puts data into Ray's object store which each trial can access
 
     # Run hyperparameter optimization
-    run_HPO(data_ref, base_seed)
+    best = run_HPO(data_ref, base_seed)
+
+    # Re train a model with the best config

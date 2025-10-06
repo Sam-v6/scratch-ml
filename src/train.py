@@ -1,21 +1,21 @@
 # Base imports
 import os
 import time
-import tempfile
 import random
 import logging
 
 # Common imports
 import numpy as np
 import pandas as pd
-from pathlib import Path
 
 # ML imports
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 import torch
 from torch.utils.data import TensorDataset, DataLoader
-import joblib # Save pkl
+
+# MLflow
+import mlflow
 
 # Local imports
 from models.lstm import LSTMRegressor
@@ -178,7 +178,84 @@ def validate_epoch(model, device, criterion, optimizer, val_loader) -> float:
 
     return val_loss
 
+def train_model(config, base_seed):
+
+    # Set seeds
+    random.seed(base_seed)
+    np.random.seed(base_seed)
+    torch.manual_seed(base_seed)
+    g = torch.Generator()    # Creates a generator that fixes the shuffle in torch Dataloader
+    g.manual_seed(base_seed)
+
+    # Create dataloaders
+    train_loader, val_loader = create_dataloaders(
+        x_train,
+        y_train,
+        x_val,
+        y_val,
+        config["batch_size"],
+        g,
+        )
+   
+    ######################################################################
+    # Create model, loss, optimizer
+    ######################################################################
+    device = torch.device("cuda:6") 
+    criterion = torch.nn.MSELoss()
+    
+    # LSTM model
+    model = create_lstm_model(
+        device=device,
+        hidden_size=int(config["hidden_size"]),
+        num_layers=int(config["num_layers"]),
+        dropout=int(config["dropout"]),
+        )
+
+    # Adapative moment estimation, makes sure we step opposite smoothed gradient and shrink/grow step based on how noisy each model parameter's gradient has been
+    optimizer = torch.optim.Adam(model.parameters())
+
+    ######################################################################
+    # Training Loop
+    ######################################################################
+    epochs = int(config["epochs"])
+    train_rmse_hist, val_rmse_hist = [], []
+    for epoch in range(1, epochs + 1):
+        # Training
+        train_loss = train_epoch(model, device, criterion, optimizer, train_loader)
+       
+        # Validation
+        val_loss = validate_epoch(model, device, criterion, optimizer, val_loader)
+     
+        # Create performance metrics
+        train_rmse = float(np.sqrt(train_loss))
+        val_rmse   = float(np.sqrt(val_loss))
+        train_rmse_hist.append(train_rmse)
+        val_rmse_hist.append(val_rmse)
+
+        # Status for screen
+        if epoch % 10 == 0:
+            logging.info(f"Epoch {epoch:02d} | train RMSE: {train_rmse:.6f} | val RMSE: {val_rmse:.6f}")
+
+    # Save loss plot
+    matplotlib.use("Agg") # Matplotlib runs headless
+    import matplotlib.pyplot as plt
+    fig = plt.figure()
+    plt.plot(range(1, epoch + 1), train_rmse_hist, label="train_rmse")
+    plt.plot(range(1, epoch + 1), val_rmse_hist,   label="val_rmse")
+    plt.xlabel("Epoch"); plt.ylabel("RMSE"); plt.title("Training/Validation RMSE")
+    plt.legend(); plt.tight_layout()
+    plt.savefig(ckpt_dir / "loss_curve.png", dpi=150)
+    plt.close(fig)
+
+    # We want to report metrics every epoch regardless if we are checkpointing
+    metrics = {
+        "val_rmse": float(val_rmse_hist[-1]),
+        "train_rmse": float(train_rmse_hist[-1]),
+        "epoch": int(epochs),
+    }
+
+
+
 if __name__ == "__main__":
     # Setup logging
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-    print('wut')
