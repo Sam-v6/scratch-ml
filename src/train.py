@@ -255,7 +255,6 @@ def train_model(config, base_seed):
     }
 
 
-
 if __name__ == "__main__":
     # Setup logging
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")

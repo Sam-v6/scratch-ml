@@ -54,6 +54,5 @@ MLflow has been configured to log results to the experiment `scratch` where all 
 
 In our training loop we have configured MLflow to checkpoint the model every 5 epochs trained, which will log both the scaler used, model, as well as a plot displaying training and validation loss across epochs. These artifacts can be accessed via MLflow after selecting a specfic trial as shown below:
 
-
 ![mlflow artifact image](./images/MLflow_artifact_example.png)
 

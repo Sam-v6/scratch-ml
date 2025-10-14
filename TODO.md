@@ -1,3 +1,3 @@
-# Do cross validation
-# Incorp Ray Train
-# ONNX
+- Implement cross validation
+- Compartmentalize into sub classes
+- Test ONNX inference
