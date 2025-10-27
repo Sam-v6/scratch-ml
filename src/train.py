@@ -3,24 +3,42 @@ import os
 import time
 import random
 import logging
-
-# Common imports
+import joblib # Save pkl
 import numpy as np
 import pandas as pd
+from pathlib import Path
+from datetime import datetime
+
+# Plotting
+import matplotlib
 
 # ML imports
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+
+# PyTorch
 import torch
 from torch.utils.data import TensorDataset, DataLoader
 
+# Ray
+from ray import tune
+from ray.train import Checkpoint
+
 # MLflow
 import mlflow
+from contextlib import nullcontext
 
 # Local imports
 from models.lstm import LSTMRegressor
 
-def make_windows(x, y, lookback: int, horizon: int = 1, stride: int = 1, as_torch: bool = True):
+def _mlflow_run_context():
+    """Start an MLflow run only if none is active (plays nice with Ray's MLflowCallback)."""
+    if mlflow.active_run() is None:
+        return mlflow.start_run()
+    else:
+        return nullcontext()
+          
+def _make_windows(x, y, lookback: int, horizon: int = 1, stride: int = 1, as_torch: bool = True):
     """
     Build sliding windows for sequence models.
 
@@ -101,12 +119,12 @@ def transform_data(base_seed):
 
     # Makes overlapping windows of data (with targets as n+1) then converts to tensors that live on CPU
     lookback = 256
-    x_seq_train_torch, y_seq_train_torch = make_windows(x_train_scaled_np, y_train, lookback=lookback, horizon=1, stride=1, as_torch=True)
-    x_seq_val_torch, y_seq_val_torch = make_windows(x_val_scaled_np, y_val, lookback=lookback, horizon=1, stride=1, as_torch=True)
+    x_seq_train_torch, y_seq_train_torch = _make_windows(x_train_scaled_np, y_train, lookback=lookback, horizon=1, stride=1, as_torch=True)
+    x_seq_val_torch, y_seq_val_torch = _make_windows(x_val_scaled_np, y_val, lookback=lookback, horizon=1, stride=1, as_torch=True)
 
     return x_seq_train_torch, y_seq_train_torch, x_seq_val_torch, y_seq_val_torch, scaler
 
-def create_dataloaders(x_train, y_train, x_val, y_val, batch_size, g):
+def _create_dataloaders(x_train, y_train, x_val, y_val, batch_size, g):
 
     ######################################################################
     # Create dataloaders
@@ -131,7 +149,7 @@ def create_dataloaders(x_train, y_train, x_val, y_val, batch_size, g):
 
     return train_loader, val_loader
 
-def create_lstm_model(device, hidden_size, num_layers, dropout):
+def _create_lstm_model(device, hidden_size, num_layers, dropout):
 
     model = LSTMRegressor(
         input_size=3,
@@ -142,7 +160,7 @@ def create_lstm_model(device, hidden_size, num_layers, dropout):
 
     return model
 
-def train_epoch(model, device, criterion, optimizer, train_loader) -> float:
+def _train_epoch(model, device, criterion, optimizer, train_loader) -> float:
 
     model.train()                   # Setting some dropout layers to go to 0 to prevent overfitting & normalize activations of previous layer
     train_loss_sum = 0.0            # For each epoch we want to zero out the training loss since we are starting fresh on the dataset
@@ -162,7 +180,7 @@ def train_epoch(model, device, criterion, optimizer, train_loader) -> float:
 
     return train_loss
 
-def validate_epoch(model, device, criterion, optimizer, val_loader) -> float:
+def _validate_epoch(model, device, criterion, optimizer, val_loader) -> float:
     model.eval()                   # Disable droput layers and activation normalization
     val_loss_sum = 0.0             # Zero out validation loss for each epoch
     n = 0
@@ -178,37 +196,60 @@ def validate_epoch(model, device, criterion, optimizer, val_loader) -> float:
 
     return val_loss
 
-def train_model(config, base_seed):
+def _plot_losses(epoch: int, train_rsme_hist: list[float], val_rsme_hist: list[float], save_dir: Path):
+    import matplotlib.pyplot as plt
+    matplotlib.use("Agg") # Matplotlib runs headless
+    fig = plt.figure()
+    plt.plot(range(1, epoch + 1), train_rmse_hist, label="train_rmse")
+    plt.plot(range(1, epoch + 1), val_rmse_hist,   label="val_rmse")
+    plt.xlabel("Epoch"); plt.ylabel("RMSE"); plt.title("Training/Validation RMSE")
+    plt.legend(); plt.tight_layout()
+    plt.savefig(save_dir / "loss_curve.png", dpi=150)
+    plt.close(fig)
+    
+def train_trial(config, data_ref, base_seed, RAY_HPO=False):
+    """Train one model that can be used with our without Ray Tune."""
 
+    #########################################################################
+    # Setup MLflow if this is not a Ray orchestrated trial
+    #########################################################################
+    if not RAY_HPO:
+        mlflow.set_tracking_uri("file:./log/mlruns")
+        scratch_experiment = mlflow.set_experiment("scratch")
+
+    #########################################################################
     # Set seeds
-    random.seed(base_seed)
+    #########################################################################
     np.random.seed(base_seed)
-    torch.manual_seed(base_seed)
-    g = torch.Generator()    # Creates a generator that fixes the shuffle in torch Dataloader
+    #torch.manual_seed(base_seed)
+    g = torch.Generator()         # Creates a generator that fixes the shuffle in torch Dataloader
     g.manual_seed(base_seed)
 
+    #########################################################################
     # Create dataloaders
-    train_loader, val_loader = create_dataloaders(
+    #########################################################################
+    x_train, y_train, x_val, y_val, scaler = data_ref   # Pull out data from Ray store
+    train_loader, val_loader = _create_dataloaders(
         x_train,
         y_train,
         x_val,
         y_val,
-        config["batch_size"],
+        int(config["batch_size"]),
         g,
         )
    
     ######################################################################
     # Create model, loss, optimizer
     ######################################################################
-    device = torch.device("cuda:6") 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # this is the Ray-assigned GPU (Ray sets CUDA_VISIBLE_DEVICES)
     criterion = torch.nn.MSELoss()
     
     # LSTM model
-    model = create_lstm_model(
+    model = _create_lstm_model(
         device=device,
         hidden_size=int(config["hidden_size"]),
         num_layers=int(config["num_layers"]),
-        dropout=int(config["dropout"]),
+        dropout=float(config["dropout"]),
         )
 
     # Adapative moment estimation, makes sure we step opposite smoothed gradient and shrink/grow step based on how noisy each model parameter's gradient has been
@@ -219,42 +260,138 @@ def train_model(config, base_seed):
     ######################################################################
     epochs = int(config["epochs"])
     train_rmse_hist, val_rmse_hist = [], []
-    for epoch in range(1, epochs + 1):
-        # Training
-        train_loss = train_epoch(model, device, criterion, optimizer, train_loader)
-       
-        # Validation
-        val_loss = validate_epoch(model, device, criterion, optimizer, val_loader)
-     
-        # Create performance metrics
-        train_rmse = float(np.sqrt(train_loss))
-        val_rmse   = float(np.sqrt(val_loss))
-        train_rmse_hist.append(train_rmse)
-        val_rmse_hist.append(val_rmse)
+    
+    # Initiate the MLflow run context
+    with _mlflow_run_context():
+        for epoch in range(1, epochs + 1):
+            
+            # Training & Validation
+            train_loss = _train_epoch(model, device, criterion, optimizer, train_loader)
+            val_loss = _validate_epoch(model, device, criterion, optimizer, val_loader)
+        
+            # Create performance metrics
+            train_rmse = float(np.sqrt(train_loss))
+            val_rmse   = float(np.sqrt(val_loss))
+            train_rmse_hist.append(train_rmse)
+            val_rmse_hist.append(val_rmse)
+        
+            # We want to report metrics every epoch regardless if we are checkpointing
+            metrics = {
+                "val_rmse": float(val_rmse_hist[-1]),
+                "train_rmse": float(train_rmse_hist[-1]),
+                "epoch": int(epoch),
+            }
 
-        # Status for screen
-        if epoch % 10 == 0:
-            logging.info(f"Epoch {epoch:02d} | train RMSE: {train_rmse:.6f} | val RMSE: {val_rmse:.6f}")
+            ######################################################################
+            # Tune logging (with MLflow callaback this is all mirrored there as well)
+            # NOTE: By calling tune.report here effectively once per epoch, that becomes our time scale!
+            ######################################################################
+            if RAY_HPO:
+                # Report metrics and save checkpoint if applicable (checkpoint every n epochs and don't have redudant checkpoints if using workers via train)
+                checkpoint = None
+                should_checkpoint = epoch % config.get("checkpoint_freq", 1) == 0
 
-    # Save loss plot
-    matplotlib.use("Agg") # Matplotlib runs headless
-    import matplotlib.pyplot as plt
-    fig = plt.figure()
-    plt.plot(range(1, epoch + 1), train_rmse_hist, label="train_rmse")
-    plt.plot(range(1, epoch + 1), val_rmse_hist,   label="val_rmse")
-    plt.xlabel("Epoch"); plt.ylabel("RMSE"); plt.title("Training/Validation RMSE")
-    plt.legend(); plt.tight_layout()
-    plt.savefig(ckpt_dir / "loss_curve.png", dpi=150)
-    plt.close(fig)
+                # NOTE: In standard DDP training, where the model is the same across all ranks, only the global rank 0 worker needs to save and report the checkpoint
+                if should_checkpoint: # add in tune.get_context().get_world_rank() == 0 when workers implemented
 
-    # We want to report metrics every epoch regardless if we are checkpointing
-    metrics = {
-        "val_rmse": float(val_rmse_hist[-1]),
-        "train_rmse": float(train_rmse_hist[-1]),
-        "epoch": int(epochs),
-    }
+                    # Create the checkpoint dir
+                    session   = tune.get_context()
+                    trial_dir = Path(session.get_trial_dir())
+                    ckpt_dir = trial_dir / f"ckpt_e{epoch:04d}"
+                    ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+                    # Save the model
+                    torch.save(model.state_dict(), ckpt_dir / "model.pt")
 
+                    # Save loss plot
+                    _plot_losses(epoch, train_rsme_hist, val_rsme_hist, ckpt_dir)
+
+                    # Save scaler
+                    joblib.dump(scaler, ckpt_dir / "standard_scaler.pkl")
+
+                    # Create checkpoint
+                    checkpoint = Checkpoint.from_directory(str(ckpt_dir))
+
+                # Report to Ray (MLflow mirroring is handled by Ray's MLflowCallback)
+                tune.report(metrics, checkpoint=checkpoint)
+            else:
+                # Standalone: log to MLflow each epoch if a run is active
+                if mlflow.active_run() is not None:
+                    mlflow.log_metrics(metrics, step=epoch)
+
+            # Status for screen
+            if epoch % 10 == 0:
+                logging.info(f"Epoch {epoch:02d} | train RMSE: {train_rmse:.6f} | val RMSE: {val_rmse:.6f}")
+
+        #########################################################################
+        # If this is not Ray orchestrated, log mlflow params, register model, and log onnx artifact
+        #########################################################################
+        if not RAY_HPO and mlflow.active_run() is not None:
+
+            # Create custom dir
+            now = datetime.now()
+            now_folder = f"{now.month}_{now.day}_{now.year}_{now.hour}_{now.minute}_{now.second}"
+            os.mkdir(os.getenv("SCRATCH_HOME"), "log", now_folder, exist_ok=True)
+
+            os.makedirs(os.path.dirname(onnx_path), exist_ok=True)
+
+            # Param logging
+            mlflow.log_params(config)
+
+            # Log the scaler object
+            mlflow.log_artifact()
+            
+            # Log the loss plot
+            _plot_losses(epoch, train_rsme_hist, val_rsme_hist, ckpt_dir)
+
+            ####################################################
+            # Build an MLflow signature using a small CPU batch
+            ####################################################
+            model.eval()
+
+            # Choose a small slice for signature + input example
+            B = int(config.get("batch_size", 64))
+            x_signature_tensor = x_train[:int(config.get("batch_size", 64))]  # torch.Tensor
+            x_example_tensor  = x_train[:10]                                  # torch.Tensor
+
+            # Run the model forward with tensors
+            with torch.no_grad():
+                y_pred_np = model(x_signature_tensor.to(device)).detach().cpu().numpy()
+
+            # Convert inputs to NumPy for MLflow
+            x_signature_np = x_signature_tensor.detach().cpu().numpy()        # np.ndarray
+            x_example_np = x_example_tensor.detach().cpu().numpy()            # np.ndarray
+
+            # Signature expects numpy (or other) hence why we converted
+            signature = mlflow.models.infer_signature(x_signature_np, y_pred_np)
+
+            # Log the trained model (CPU for portability)
+            mlflow.pytorch.log_model(
+                pytorch_model=model.to("cpu"),
+                signature=signature,
+                input_example=x_example_np,
+            )
+
+            ####################################################
+            # ONNX export
+            ####################################################
+            # Use a batch=1 example for LSTM safety
+            example_input_t = x_example_tensor[:1].detach().cpu().float()
+
+            onnx_path = os.path.join(os.getenv("SCRATCH_HOME", "."), "log", "model.onnx")
+            os.makedirs(os.path.dirname(onnx_path), exist_ok=True)
+
+            torch.onnx.export(
+                model.to("cpu").eval(),
+                example_input_t,
+                onnx_path,
+                input_names=["input"],
+                output_names=["output"],
+                opset_version=int(config.get("onnx_opset", 18)),  # guess
+                dynamo=True,
+            )
+            mlflow.log_artifact(onnx_path)
+  
 if __name__ == "__main__":
     # Setup logging
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
