@@ -56,3 +56,55 @@ In our training loop we have configured MLflow to checkpoint the model every 5 e
 
 ![mlflow artifact image](./images/MLflow_artifact_example.png)
 
+
+# Model deployment
+
+### Deployment with python virtual environment
+If we want to simply keep using our virtual environment for inference, can run:
+
+```
+PYTHONPATH=/home/sevani/repos/scratch-ml/src \
+MLFLOW_TRACKING_URI="file:/home/sevani/repos/scratch-ml/log/mlruns" \
+mlflow models serve -m "models:/lstm/2" -p 5001 --env-manager local
+```
+
+Stepping through what we did here, we are:
+- Indicating where the model code is located
+- Setting where are ml runs are located
+- Serving the model from our local virtual environment on port 5001 with our prior registered model (and second version of this model)
+
+To perform inference, an example of how we can post a http request and recieve the output in json form is provided in `src/deploy/inference_venv.py`. 
+
+### Deployment with Docker
+A more robust way to deploy our model would be with a standalone docker container.
+
+We can accomplish this with two steps, first:
+
+```
+MLFLOW_DOCKER_BASE_IMAGE=python:3.13-slim \
+PYTHONPATH=/home/sevani/repos/scratch-ml/src \
+MLFLOW_TRACKING_URI="file:/home/sevani/repos/scratch-ml/log/mlruns" \
+mlflow models build-docker \
+  -m "models:/lstm/2" \
+  -n lstm-serve \
+  --env-manager local \
+  --install-mlflow
+```
+
+Stepping through what we are doing here:
+- Setting the specific Docker image we would like to pull (since we are using Python 3.13 we select that image)
+- Set our python path where are code lives
+- Set where are mlruns live
+- Build a docker image with:
+ - The model in our regsitry
+ - What we want the image called
+ - A local virtual environment
+ - Install mlflow after we have setup everything else
+
+# TODO: Fix this so the running of the container works
+Then to run the container
+```
+docker run -p 5001:8080 lstm-serve
+```
+
+To get inference from that deployed model

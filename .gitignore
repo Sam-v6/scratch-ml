@@ -208,3 +208,4 @@ __marimo__/
 
 # Mlflow and ray results
 log/
+mlruns/
