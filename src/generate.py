@@ -1,18 +1,21 @@
 # Base imports
 import os
 
-# Common imports
+# Additional imports
 import numpy as np
 import pandas as pd
 import scipy as sp
 import matplotlib.pyplot as plt
 from scipy import signal
 
+# Local imports
+from paths import SCRATCH_HOME
+
 #########################################################################
 # Create feature data
 #########################################################################
 inputs = {}          # We will store our data in this dict initially
-np.random.seed(42) # Fix the seed to some constant number like the answer to everything
+np.random.seed(42)   # Fix the seed to some constant number like the answer to everything
 
 # Define signal parameters
 T = 20    # period (seconds)
@@ -115,9 +118,9 @@ axs[3].set_xlim(1, 20)
 axs[3].set_ylim(1, 5)
 # Save
 plt.tight_layout()
-plt.savefig(os.path.join(os.getenv('SCRATCH_HOME'), 'data', 'input', 'data_signals.png'), dpi=800)
+plt.savefig(SCRATCH_HOME / "data" / "input" / "data_signals.png", dpi=800)
 
 # Save to csv
 df = pd.DataFrame(inputs)
 print(df.head())
-df.to_csv(os.path.join(os.getenv('SCRATCH_HOME'), 'data', 'input', 'data_signals.csv'), index=False)
+df.to_csv(SCRATCH_HOME / "data" / "input" / "data_signals.csv", index=False)

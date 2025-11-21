@@ -30,6 +30,7 @@ from contextlib import nullcontext
 
 # Local imports
 from models.lstm import LSTMRegressor
+from paths import SCRATCH_HOME
 
 def _mlflow_run_context():
     """Start an MLflow run only if none is active (plays nice with Ray's MLflowCallback)."""
@@ -96,7 +97,7 @@ def transform_data(base_seed):
     ######################################################################
     # Load data and do splits
     ######################################################################
-    input_path = os.path.join(os.getenv('SCRATCH_HOME'), 'data', 'input')
+    input_path = SCRATCH_HOME / "data" / "input"
 
     # Load in training data
     df = pd.read_csv(os.path.join(input_path, 'data_signals.csv'))
@@ -196,7 +197,7 @@ def _validate_epoch(model, device, criterion, optimizer, val_loader) -> float:
 
     return val_loss
 
-def _plot_losses(epoch: int, train_rsme_hist: list[float], val_rsme_hist: list[float], save_dir: Path):
+def _plot_losses(epoch: int, train_rmse_hist: list[float], val_rmse_hist: list[float], save_dir: Path):
     import matplotlib.pyplot as plt
     matplotlib.use("Agg") # Matplotlib runs headless
     fig = plt.figure()
@@ -204,8 +205,11 @@ def _plot_losses(epoch: int, train_rsme_hist: list[float], val_rsme_hist: list[f
     plt.plot(range(1, epoch + 1), val_rmse_hist,   label="val_rmse")
     plt.xlabel("Epoch"); plt.ylabel("RMSE"); plt.title("Training/Validation RMSE")
     plt.legend(); plt.tight_layout()
-    plt.savefig(save_dir / "loss_curve.png", dpi=150)
+    loss_plot_path = save_dir / "loss_curve.png"
+    plt.savefig(loss_plot_path, dpi=150)
     plt.close(fig)
+
+    return loss_plot_path
     
 def train_trial(config, data_ref, base_seed, RAY_HPO=False):
     """Train one model that can be used with our without Ray Tune."""
@@ -214,8 +218,9 @@ def train_trial(config, data_ref, base_seed, RAY_HPO=False):
     # Setup MLflow if this is not a Ray orchestrated trial
     #########################################################################
     if not RAY_HPO:
-        mlflow.set_tracking_uri("file:./log/mlruns")
-        scratch_experiment = mlflow.set_experiment("scratch")
+        mlflow_db_path = SCRATCH_HOME / "log" / "mlflow.db"
+        mlflow_tracking_uri = f"sqlite:///{mlflow_db_path}"
+        mlflow.set_tracking_uri(mlflow_tracking_uri)
 
     #########################################################################
     # Set seeds
@@ -283,7 +288,7 @@ def train_trial(config, data_ref, base_seed, RAY_HPO=False):
             }
 
             ######################################################################
-            # Tune logging (with MLflow callaback this is all mirrored there as well)
+            # Tune logging (with MLflow callback this is all mirrored there as well)
             # NOTE: By calling tune.report here effectively once per epoch, that becomes our time scale!
             ######################################################################
             if RAY_HPO:
@@ -304,7 +309,7 @@ def train_trial(config, data_ref, base_seed, RAY_HPO=False):
                     torch.save(model.state_dict(), ckpt_dir / "model.pt")
 
                     # Save loss plot
-                    _plot_losses(epoch, train_rsme_hist, val_rsme_hist, ckpt_dir)
+                    _plot_losses(epoch, train_rmse_hist, val_rmse_hist, ckpt_dir)
 
                     # Save scaler
                     joblib.dump(scaler, ckpt_dir / "standard_scaler.pkl")
@@ -330,19 +335,20 @@ def train_trial(config, data_ref, base_seed, RAY_HPO=False):
 
             # Create custom dir
             now = datetime.now()
-            now_folder = f"{now.month}_{now.day}_{now.year}_{now.hour}_{now.minute}_{now.second}"
-            os.mkdir(os.getenv("SCRATCH_HOME"), "log", now_folder, exist_ok=True)
-
-            os.makedirs(os.path.dirname(onnx_path), exist_ok=True)
+            now_folder_path = SCRATCH_HOME / "log" / f"{now.month}_{now.day}_{now.year}_{now.hour}_{now.minute}_{now.second}"
+            now_folder_path.mkdir(parents=True, exist_ok=True)
 
             # Param logging
             mlflow.log_params(config)
 
             # Log the scaler object
-            mlflow.log_artifact()
+            scaler_path = now_folder_path / "standard_scaler.pkl"
+            joblib.dump(scaler, scaler_path)
+            mlflow.log_artifact(scaler_path)
             
             # Log the loss plot
-            _plot_losses(epoch, train_rsme_hist, val_rsme_hist, ckpt_dir)
+            loss_plot_path = _plot_losses(epoch, train_rmse_hist, val_rmse_hist, now_folder_path)
+            mlflow.log_artifact(loss_plot_path)
 
             ####################################################
             # Build an MLflow signature using a small CPU batch
@@ -377,9 +383,7 @@ def train_trial(config, data_ref, base_seed, RAY_HPO=False):
             ####################################################
             # Use a batch=1 example for LSTM safety
             example_input_t = x_example_tensor[:1].detach().cpu().float()
-
-            onnx_path = os.path.join(os.getenv("SCRATCH_HOME", "."), "log", "model.onnx")
-            os.makedirs(os.path.dirname(onnx_path), exist_ok=True)
+            onnx_path = now_folder_path / "model.onnx"
 
             torch.onnx.export(
                 model.to("cpu").eval(),

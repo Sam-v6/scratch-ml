@@ -18,12 +18,17 @@ from ray.tune.schedulers import ASHAScheduler
 
 # Local imports
 from train import transform_data, train_trial
+from paths import SCRATCH_HOME
 
 def run_HPO(data_ref, seed):
     ######################################################################
     # Start parent HPO, MLflow session
     ######################################################################
-    mlflow_tracking_uri = f"file:{os.path.abspath('./log/mlruns')}"  # absolute path
+    log_dir = SCRATCH_HOME / "log"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    mlflow_db_path = log_dir / "mlflow.db"
+    mlflow_tracking_uri = f"sqlite:///{mlflow_db_path}"
+    mlflow.set_tracking_uri(mlflow_tracking_uri)
     experiment = "scratch"
 
     ######################################################################
@@ -118,7 +123,7 @@ if __name__ == "__main__":
         )
 
     # Save best configuration to JSON
-    config_path = os.path.join(os.getenv('SCRATCH_HOME'), 'log', 'best_config.json')
+    config_path = SCRATCH_HOME / "log" / "best_config.json"
     with open(config_path, 'w') as f:
         json.dump(best.config, f, indent=4)
 

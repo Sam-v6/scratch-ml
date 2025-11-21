@@ -28,33 +28,5 @@ dependencies = [
     "scipy>=1.16.2",
     "tensorboard>=2.20.0",
     "torch>=2.8.0",
+    "torchvision>=0.23.0",
 ]
-
-[tool.uv.workspace]
-members = [
-    "something",
-]
-
-[tool.setuptools.packages.find]
-where = []
-
-# [project.urls]
-# Homepage = "https://github.com/your-username/your-package-name"
-# Repository = "https://github.com/your-username/your-package-name"
-# Documentation = "https://your-package-name.readthedocs.io/"
-
-# [project.optional-dependencies]
-# dev = [
-#     "pytest",
-#     "black",
-#     "mypy",
-# ]
-# docs = [
-#     "sphinx",
-#     "sphinx-rtd-theme",
-# ]
-
-# Example for a specific tool configuration (Black formatter)
-# [tool.black]
-# line-length = 88
-# target-version = ['py38', 'py39', 'py310', 'py311', 'py312']

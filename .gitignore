@@ -209,3 +209,4 @@ __marimo__/
 # Mlflow and ray results
 log/
 mlruns/
+mlflow.db
