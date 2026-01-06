@@ -2,11 +2,16 @@
 Sandbox environment to test Ray Train, Ray Tune, MLflow, and time series modeling together.
 
 # Setup
-This repo uses `uv` for handling virtual environments. If you don't have uv installed please see [uv docs](https://docs.astral.sh/uv/)
+This project uses `uv` for managing the python virtual environment. To install uv please see the official [documentation](https://docs.astral.sh/uv/getting-started/installation/) or install via CLI below:
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
 
-Once you have uv installed please run:
-- `uv sync` (creates virtual env with all depdencies based on lock file)
-- `source .venv/bin/activate`
+To create and activate the virtual environment and setup git hooks (for auto linting and formatting), run the following:
+```bash
+uv sync --locked
+uv run pre-commit install
+```
 
 # Data Creation
 First we create some fake "sensor" time series data by pretending we are measuring three unique 1-5 V sensors. We produce this time series data with:
@@ -46,7 +51,13 @@ https://docs.ray.io/en/latest/tune/examples/tune-mlflow.html
 Ray will log results to `log/ray_results/lstm_hpo` where the Ray UI can be used to view these logs. However, MLflow is also configured in the training loop with the Ray callback such that all information can be seen in MLflow itself. 
 
 To launch MLflow UI users can run this in a seperate terminal (keep in mind you need to activate the same virtual environment)
-`mlflow ui --backend-store-uri ./log/mlruns`
+```bash
+# On a new terminal, source the virtual environment
+source .venv/bin/activate
+
+# Run the MLflow ui
+mlflow ui --backend-store-uri ./log/mlruns
+```
 
 MLflow has been configured to log results to the experiment `scratch` where all of our 100 trials can be filtered, selected, or queried. MLflow offers a convienent summary table where we can easily see our best trial based on lowest validation RMSE and the associated hyperparameters if we select a few columns
 
