@@ -1,0 +1,8 @@
+{
+    "hidden_size": 128,
+    "num_layers": 1,
+    "dropout": 0.0,
+    "batch_size": 32,
+    "epochs": 50,
+    "checkpoint_freq": 5
+}

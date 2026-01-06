@@ -14,7 +14,7 @@ from ray.air.integrations.mlflow import MLflowLoggerCallback
 from ray.tune import FailureConfig, RunConfig, TuneConfig, Tuner
 from ray.tune.schedulers import ASHAScheduler
 
-from paths import SCRATCH_HOME
+from paths import PROJECT_ROOT
 
 # Local imports
 from train import train_trial, transform_data
@@ -24,7 +24,7 @@ def run_HPO(data_ref: ray.data.Dataset, seed: int) -> tune.result_grid.ResultGri
 	######################################################################
 	# Start parent HPO, MLflow session
 	######################################################################
-	log_dir = SCRATCH_HOME / "log"
+	log_dir = PROJECT_ROOT / "log"
 	log_dir.mkdir(parents=True, exist_ok=True)
 	mlflow_db_path = log_dir / "mlflow.db"
 	mlflow_tracking_uri = f"sqlite:///{mlflow_db_path}"
@@ -123,7 +123,7 @@ if __name__ == "__main__":
 	)
 
 	# Save best configuration to JSON
-	config_path = SCRATCH_HOME / "log" / "best_config.json"
+	config_path = PROJECT_ROOT / "log" / "best_config.json"
 	with open(config_path, "w") as f:
 		json.dump(best.config, f, indent=4)
 

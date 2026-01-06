@@ -1,37 +1,24 @@
 # Base imports
+import json
 import logging
 import os
 from contextlib import nullcontext
-from datetime import datetime
 from pathlib import Path
 
-import joblib  # Save pkl
-
-# Plotting
 import matplotlib
-
-# MLflow
 import mlflow
 import numpy as np
 import pandas as pd
-
-# PyTorch
 import torch
-
-# Ray
 from ray import tune
-from ray.train import Checkpoint
-
-# ML imports
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
 
-# Local imports
 from models.lstm import LSTMRegressor
-from paths import SCRATCH_HOME
+from paths import PROJECT_ROOT
 
 
-def _mlflow_run_context() -> mlflow.start_run | nullcontext:
+def _mlflow_run_context() -> mlflow.ActiveRun | nullcontext:
 	"""Start an MLflow run only if none is active (plays nice with Ray's MLflowCallback)."""
 	if mlflow.active_run() is None:
 		return mlflow.start_run()
@@ -96,7 +83,7 @@ def transform_data(base_seed: int) -> tuple[torch.Tensor, torch.Tensor, torch.Te
 	######################################################################
 	# Load data and do splits
 	######################################################################
-	input_path = SCRATCH_HOME / "data" / "input"
+	input_path = PROJECT_ROOT / "data" / "input"
 
 	# Load in training data
 	df = pd.read_csv(os.path.join(input_path, "data_signals.csv"))
@@ -226,7 +213,7 @@ def train_trial(config: dict, data_ref: tuple[torch.Tensor, torch.Tensor, torch.
 	# Setup MLflow if this is not a Ray orchestrated trial
 	#########################################################################
 	if not RAY_HPO:
-		mlflow_db_path = SCRATCH_HOME / "log" / "mlflow.db"
+		mlflow_db_path = PROJECT_ROOT / "log" / "mlflow.db"
 		mlflow_tracking_uri = f"sqlite:///{mlflow_db_path}"
 		mlflow.set_tracking_uri(mlflow_tracking_uri)
 
@@ -272,6 +259,7 @@ def train_trial(config: dict, data_ref: tuple[torch.Tensor, torch.Tensor, torch.
 	# Training Loop
 	######################################################################
 	epochs = int(config["epochs"])
+	best_val_loss = float("inf")
 	train_rmse_hist, val_rmse_hist = [], []
 
 	# Initiate the MLflow run context
@@ -299,36 +287,14 @@ def train_trial(config: dict, data_ref: tuple[torch.Tensor, torch.Tensor, torch.
 			# NOTE: By calling tune.report here effectively once per epoch, that becomes our time scale!
 			######################################################################
 			if RAY_HPO:
-				# Report metrics and save checkpoint if applicable (checkpoint every n epochs and don't have redudant checkpoints if using workers via train)
-				checkpoint = None
-				should_checkpoint = epoch % config.get("checkpoint_freq", 1) == 0
-
-				# NOTE: In standard DDP training, where the model is the same across all ranks, only the global rank 0 worker needs to save and report the checkpoint
-				if should_checkpoint:  # add in tune.get_context().get_world_rank() == 0 when workers implemented
-					# Create the checkpoint dir
-					session = tune.get_context()
-					trial_dir = Path(session.get_trial_dir())
-					ckpt_dir = trial_dir / f"ckpt_e{epoch:04d}"
-					ckpt_dir.mkdir(parents=True, exist_ok=True)
-
-					# Save the model
-					torch.save(model.state_dict(), ckpt_dir / "model.pt")
-
-					# Save loss plot
-					_plot_losses(epoch, train_rmse_hist, val_rmse_hist, ckpt_dir)
-
-					# Save scaler
-					joblib.dump(scaler, ckpt_dir / "standard_scaler.pkl")
-
-					# Create checkpoint
-					checkpoint = Checkpoint.from_directory(str(ckpt_dir))
-
 				# Report to Ray (MLflow mirroring is handled by Ray's MLflowCallback)
-				tune.report(metrics, checkpoint=checkpoint)
+				tune.report(metrics)
 			else:
-				# Standalone: log to MLflow each epoch if a run is active
-				if mlflow.active_run() is not None:
-					mlflow.log_metrics(metrics, step=epoch)
+				# Update saved model
+				best_model_path = PROJECT_ROOT / "data" / "training" / "lstm.pt"
+				if np.mean(val_rmse_hist) < best_val_loss:
+					best_val_loss = np.mean(val_rmse_hist)
+					torch.save(model.state_dict(), best_model_path)
 
 			# Status for screen
 			if epoch % 10 == 0:
@@ -337,23 +303,11 @@ def train_trial(config: dict, data_ref: tuple[torch.Tensor, torch.Tensor, torch.
 		#########################################################################
 		# If this is not Ray orchestrated, log mlflow params, register model, and log onnx artifact
 		#########################################################################
-		if not RAY_HPO and mlflow.active_run() is not None:
-			# Create custom dir
-			now = datetime.now()
-			now_folder_path = SCRATCH_HOME / "log" / f"{now.month}_{now.day}_{now.year}_{now.hour}_{now.minute}_{now.second}"
-			now_folder_path.mkdir(parents=True, exist_ok=True)
-
-			# Param logging
-			mlflow.log_params(config)
-
-			# Log the scaler object
-			scaler_path = now_folder_path / "standard_scaler.pkl"
-			joblib.dump(scaler, scaler_path)
-			mlflow.log_artifact(scaler_path)
-
-			# Log the loss plot
-			loss_plot_path = _plot_losses(epoch, train_rmse_hist, val_rmse_hist, now_folder_path)
-			mlflow.log_artifact(loss_plot_path)
+		if not RAY_HPO:
+			# Plot the training results (we don't want to do this with HPO because Ray records these as metrics)
+			ARTIFACT_PATH = PROJECT_ROOT / "artifacts"
+			ARTIFACT_PATH.mkdir(parents=True, exist_ok=True)
+			_plot_losses(epoch, train_rmse_hist, val_rmse_hist, ARTIFACT_PATH)
 
 			####################################################
 			# Build an MLflow signature using a small CPU batch
@@ -387,7 +341,7 @@ def train_trial(config: dict, data_ref: tuple[torch.Tensor, torch.Tensor, torch.
 			####################################################
 			# Use a batch=1 example for LSTM safety
 			example_input_t = x_example_tensor[:1].detach().cpu().float()
-			onnx_path = now_folder_path / "model.onnx"
+			onnx_path = ARTIFACT_PATH / "model.onnx"
 
 			torch.onnx.export(
 				model.to("cpu").eval(),
@@ -404,3 +358,20 @@ def train_trial(config: dict, data_ref: tuple[torch.Tensor, torch.Tensor, torch.
 if __name__ == "__main__":
 	# Setup logging
 	logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+	# Get data
+	base_seed = 42
+	x_train, y_train, x_val, y_val, scaler = transform_data(base_seed)
+
+	# Load model params from json
+	config_path = PROJECT_ROOT / "data" / "model_params.json"
+	with open(config_path) as f:
+		model_params_config = json.load(f)
+
+	# Train
+	train_trial(
+		config=model_params_config,
+		data_ref=(x_train, y_train, x_val, y_val, scaler),
+		base_seed=base_seed,
+		RAY_HPO=False,
+	)

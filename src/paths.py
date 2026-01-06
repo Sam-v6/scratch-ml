@@ -1,5 +1,5 @@
 from pathlib import Path
 
-SCRATCH_HOME = Path.cwd().resolve()
-SRC_HOME = SCRATCH_HOME / "src"
-DATA_HOME = SCRATCH_HOME / "data"
+PROJECT_ROOT = Path.cwd().resolve()
+SRC_HOME = PROJECT_ROOT / "src"
+DATA_HOME = PROJECT_ROOT / "data"

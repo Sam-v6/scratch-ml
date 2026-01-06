@@ -7,7 +7,7 @@ import pandas as pd
 from scipy import signal
 
 # Local imports
-from paths import SCRATCH_HOME
+from paths import PROJECT_ROOT
 
 #########################################################################
 # Create feature data
@@ -118,9 +118,9 @@ axs[3].set_xlim(1, 20)
 axs[3].set_ylim(1, 5)
 # Save
 plt.tight_layout()
-plt.savefig(SCRATCH_HOME / "data" / "input" / "data_signals.png", dpi=800)
+plt.savefig(PROJECT_ROOT / "data" / "input" / "data_signals.png", dpi=800)
 
 # Save to csv
 df = pd.DataFrame(inputs)
 print(df.head())
-df.to_csv(SCRATCH_HOME / "data" / "input" / "data_signals.csv", index=False)
+df.to_csv(PROJECT_ROOT / "data" / "input" / "data_signals.csv", index=False)
