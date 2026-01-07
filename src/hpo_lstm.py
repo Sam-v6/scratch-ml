@@ -4,23 +4,18 @@ import json
 import logging
 import os
 
-# MLflow
 import mlflow
-
-# Ray Tune
 import ray
 from ray import tune
 from ray.air.integrations.mlflow import MLflowLoggerCallback
 from ray.tune import FailureConfig, RunConfig, TuneConfig, Tuner
 from ray.tune.schedulers import ASHAScheduler
 
-from paths import PROJECT_ROOT
-
-# Local imports
-from train import train_trial, transform_data
+from common.paths import PROJECT_ROOT
+from lstm import LstmModel
 
 
-def run_HPO(data_ref: ray.data.Dataset, seed: int) -> tune.result_grid.ResultGrid:
+def run_HPO(data_ref: ray.data.Dataset, lstmModel: LstmModel) -> tune.result_grid.ResultGrid:
 	######################################################################
 	# Start parent HPO, MLflow session
 	######################################################################
@@ -61,9 +56,8 @@ def run_HPO(data_ref: ray.data.Dataset, seed: int) -> tune.result_grid.ResultGri
 	######################################################################
 	# Allows each training run to get training data from shared object store and random seed
 	trainable = tune.with_parameters(
-		train_trial,  # The function that we want
+		lstmModel.train_trial,  # The function that we want
 		data_ref=data_ref,  # The data we are passing in
-		base_seed=base_seed,  # Random seed we want everything to go from
 		RAY_HPO=True,  # Indicating this is a HPO run where MLflow logging will work differently
 	)
 
@@ -110,20 +104,22 @@ if __name__ == "__main__":
 	# Setup logging
 	logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+	# Create trainer
+	lstmModel = LstmModel()
+
 	# Set seed the get data and store it common share
 	ray.init()
-	base_seed = 42
-	x_train, y_train, x_val, y_val, scaler = transform_data(base_seed)
+	x_train, y_train, x_val, y_val, scaler = lstmModel.transform_data()
 	data_ref = ray.put((x_train, y_train, x_val, y_val, scaler))  # Puts data into Ray's object store which each trial can access
 
 	# Run hyperparameter optimization
 	best = run_HPO(
 		data_ref,
-		base_seed,
+		lstmModel,
 	)
 
 	# Save best configuration to JSON
-	config_path = PROJECT_ROOT / "log" / "best_config.json"
+	config_path = PROJECT_ROOT / "data" / "model_params.json"
 	with open(config_path, "w") as f:
 		json.dump(best.config, f, indent=4)
 
@@ -131,9 +127,8 @@ if __name__ == "__main__":
 	with open(config_path) as f:
 		best_config = json.load(f)
 
-	train_trial(
+	lstmModel.train_trial(
 		config=best_config,
 		data_ref=(x_train, y_train, x_val, y_val, scaler),
-		base_seed=base_seed,
 		RAY_HPO=False,
 	)
