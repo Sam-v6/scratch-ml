@@ -1,7 +1,6 @@
 # Base imports
 import json
 import logging
-import os
 from pathlib import Path
 
 import matplotlib
@@ -24,6 +23,7 @@ class LstmModel:
 
 	def __init__(self, lookback: int) -> None:
 		self.lookback = lookback
+		self.best_val_loss = float("inf")
 
 	###################################
 	# Data
@@ -203,7 +203,7 @@ class LstmModel:
 
 		return loss_plot_path
 
-	def train_trial(self, config: dict, data_ref: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, StandardScaler], RAY_HPO: bool = False) -> None | float:
+	def train_trial(self, config: dict, data_ref: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, StandardScaler], RAY_HPO: bool = False) -> None:
 		"""Train one model that can be used with our without Ray Tune."""
 
 		#########################################################################
@@ -282,7 +282,7 @@ class LstmModel:
 				# Update saved model
 				best_model_path = ARTIFACT_PATH / "lstm.pt"
 				if np.mean(val_rmse_hist) < best_val_loss:
-					best_val_loss = np.mean(val_rmse_hist)
+					self.best_val_loss = np.mean(val_rmse_hist)
 					torch.save(model.state_dict(), best_model_path)
 
 			# Status for screen
@@ -314,8 +314,6 @@ class LstmModel:
 				dynamo=True,
 			)
 
-			return best_val_loss
-
 	def train_model(self) -> None:
 		"""Main training function."""
 		# Get data
@@ -327,17 +325,19 @@ class LstmModel:
 			model_params_config = json.load(f)
 
 		# Train
-		self.train_trial(
+		best_val_loss = self.train_trial(
 			config=model_params_config,
 			data_ref=(x_train, y_train, x_val, y_val, scaler),
 			RAY_HPO=False,
 		)
 
+		return best_val_loss
+
 	##################################
 	# Predictions
 	##################################
 	@torch.no_grad()
-	def _predict_ordered_windows(model: torch.nn.Module, X: torch.Tensor, device: torch.device) -> np.ndarray:
+	def _predict_ordered_windows(self, model: torch.nn.Module, X: torch.Tensor, device: torch.device) -> np.ndarray:
 		model.eval()
 		# If large, do mini-batches; for small, one shot is fine:
 		X = X.to(device)
@@ -369,7 +369,7 @@ class LstmModel:
 		t_idx_val = train_end + np.arange(self.lookback, self.lookback + N_va)  # absolute:  train_end+lookback .. T-1
 
 		# Determine normalized RMSE (by mean)
-		nRMSE = (best_val / df["target"].mean()) * 100
+		nRMSE = (self.best_val_loss / df["target"].mean()) * 100
 
 		return yhat_train, yhat_val, time, t_idx_train, t_idx_val, nRMSE
 
@@ -384,7 +384,7 @@ class LstmModel:
 		ax.set_ylabel("Voltage (V)")
 		ax.set_xlim(1, 20)
 		ax.set_ylim(1, 5)
-		ax.set_title(f"Predictions Aligned to Real Time\nRMSE: {round(best_val, 2)} V, nRMSE (mean): {round(nRMSE, 2)}%")
+		ax.set_title(f"Predictions Aligned to Real Time\nRMSE: {round(self.best_val_loss, 2)} V, nRMSE (mean): {round(nRMSE, 2)}%")
 		ax.legend()
 		plt.tight_layout()
 		plt.savefig(ARTIFACT_PATH / "predictions.png", dpi=300)
@@ -422,7 +422,7 @@ class LstmModel:
 			train_end,
 		)
 
-		# PLot predictions
+		# Plot predictions
 		self._plot_predictions(
 			df,
 			yhat_train,
@@ -439,7 +439,7 @@ if __name__ == "__main__":
 	logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 	# Train model
-	lstmModel = LstmModel()
+	lstmModel = LstmModel(lookback=256)
 	lstmModel.train_model()
 
 	# Run predictions
