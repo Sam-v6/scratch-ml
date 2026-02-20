@@ -1,374 +1,467 @@
-# Base imports
+"""
+train.py -- train all four time-series models and produce comparison artifacts
+
+Usage (from repo root):
+    python src/train.py
+    # or
+    uv run python src/train.py
+
+Outputs written to SCRATCH_HOME/artifacts/:
+    {ModelName}_loss.png  -- per-model train/val RMSE curves
+    comparison.png        -- 3x2 summary figure across all models
+
+A summary table is also printed to stdout.
+"""
+
+import math
 import os
 import time
-import tempfile
-import random
-import logging
 
-# Common imports
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from pathlib import Path
-
-# Plotting
-import matplotlib
-
-# ML imports
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
 import torch
-from torch.utils.data import TensorDataset, DataLoader
-import joblib # Save pkl
+import torch.nn as nn
+from sklearn.preprocessing import StandardScaler
+from torch.utils.data import DataLoader, TensorDataset
 
-# Ray Tune
-import ray
-from ray import train, tune, air
-from ray.air.integrations.mlflow import MLflowLoggerCallback, setup_mlflow
-from ray.train import Checkpoint
-from ray.tune import Tuner, RunConfig, TuneConfig, FailureConfig
-from ray.tune.schedulers import ASHAScheduler
+from models import TCN, ImprovedLSTM, NaiveLSTM, TimeSeriesTransformer
+from path import SCRATCH_HOME
 
-# Local imports
-from lstm import LSTMRegressor
+# =============================================================================
+# Configuration
+# =============================================================================
 
-def make_windows(x, y, lookback: int, horizon: int = 1, stride: int = 1, as_torch: bool = True):
+CONFIG = {
+    "data_path": SCRATCH_HOME / "data" / "input" / "data_signals.csv",
+    "artifacts": SCRATCH_HOME / "artifacts",  # directory for output PNGs
+    "lookback": 256,  # number of past timesteps fed to the model
+    "horizon": 1,  # number of future steps to predict
+    "train_frac": 0.6,  # fraction of data used for training (temporal split)
+    "batch_size": 64,
+    "epochs": 100,
+    "lr": 1e-3,
+    "seed": 42,
+}
+
+
+# =============================================================================
+# Data helpers
+# =============================================================================
+
+
+def make_windows(
+    x: np.ndarray,
+    y: np.ndarray,
+    lookback: int,
+    horizon: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Build sliding windows for sequence models.
+    Build sliding windows over a time series.
 
-    Args:
-        x: np.ndarray of shape (T, x_dim)
-        y: np.ndarray of shape (T,) or (T, y_dim)
-        lookback: number of past steps per input window
-        horizon: number of future steps to predict (default: 1 = next-step)
-        stride: shift between consecutive windows (default: 1)
-        as_torch: if True, return torch.float32 tensors, else numpy arrays
+    For a sequence of length N:
+        X[i] = x[i : i+lookback]                  shape (lookback, F)
+        Y[i] = y[i+lookback : i+lookback+horizon]  shape (horizon,)
 
-    Returns:
-        X: (N of windows (batches), lookback, x_features)
-        Y: (N of windows, y_features) if horizon==1 else (N of windows, horizon, y_features)
+    The windows step by 1 each time (maximum overlap).  Temporal order is
+    preserved -- no shuffling here.
 
-    Notes:
-        - No shuffling; preserves time order (good for forecasting).
-        - No leakage: each target window starts exactly after each input window.
-        - Number of windows (or batches) is N = ((total number of samples - lookback - horizon)/stride) + 1
+    Returns torch Tensors (float32).
     """
-    x = np.asarray(x)
-    y = np.asarray(y)
-
-    if y.ndim == 1:
-        y = y.reshape(-1, 1)
-
-    T = x.shape[0]
-    x_dim = x.shape[1]
-    y_dim = y.shape[1]
-
-    max_start = T - lookback - horizon + 1
-    if max_start <= 0:
-        raise ValueError(f"Not enough timesteps: T={T}, lookback={lookback}, horizon={horizon}")
-
-    X_list, Y_list = [], []
-    for start in range(0, max_start, stride):
-        end = start + lookback
-        tgt_end = end + horizon
-        X_list.append(x[start:end])           # (lookback, x_dim)
-        Y_list.append(y[end:tgt_end])         # (horizon, y_dim)
-
-    X = np.stack(X_list, axis=0)              # (N, lookback, x_dim)
-    Y = np.stack(Y_list, axis=0)              # (N, horizon, y_dim)
-
-    if horizon == 1:
-        Y = Y[:, 0, :]                        # (N, y_dim)
-
-    if as_torch:
-        X = torch.from_numpy(X).to(torch.float32)
-        Y = torch.from_numpy(Y).to(torch.float32)
-
+    xs, ys = [], []
+    for i in range(len(x) - lookback - horizon + 1):
+        xs.append(x[i : i + lookback])
+        ys.append(y[i + lookback : i + lookback + horizon])
+    X = torch.tensor(np.stack(xs), dtype=torch.float32)  # (N, lookback, F)
+    Y = torch.tensor(np.stack(ys), dtype=torch.float32)  # (N, horizon)
     return X, Y
 
-def transform_data(base_seed):
-    ######################################################################
-    # Load data and do splits
-    ######################################################################
-    input_path = os.path.join(os.getenv('SCRATCH_HOME'), 'data', 'input')
 
-    # Load in training data
-    df = pd.read_csv(os.path.join(input_path, 'data_signals.csv'))
-    
-    # Assign time series data
-    x = df[['sine', 'square', 'triangle']].to_numpy(dtype=np.float32)
-    y = df[['target']].to_numpy(dtype=np.float32)
+def load_data(config: dict) -> tuple[DataLoader, DataLoader]:
+    """
+    Load the CSV, scale features, build sliding windows, and return DataLoaders.
 
-    # Splittys (but since it's time series we don't need anything extra here)
-    train_end = int(0.8 * len(df))
-    x_train, x_val = x[:train_end, :], x[train_end:, :]
-    y_train, y_val = y[:train_end, :], y[train_end:, :]
+    Data pipeline:
+        1. Read CSV -- columns: time, sine, square, triangle, target
+        2. Temporal split at train_frac (no shuffling; preserves time ordering)
+        3. Fit StandardScaler on training features only -> transform both splits
+           (prevents leakage: validation statistics must not influence scaling)
+        4. Build overlapping windows of length `lookback`
+        5. Wrap in DataLoaders (train shuffled, val not shuffled)
+    """
+    df = pd.read_csv(config["data_path"])
 
-    # Standarize features
-    # NOTE: Calculates the mean and standard deviation for each feature in the training set and applies scaling transformation
-    # X' = (X - mean of feature) / std of feature --> after scaling each features has mean of 0 is and std of 1 ish, all features get normalized to similar range
-    scaler = StandardScaler().fit(x_train) # We want to scale only on training data to avoid leakage
-    x_train_scaled_np = scaler.transform(x_train)
-    x_val_scaled_np   = scaler.transform(x_val)
+    features = ["sine", "square", "triangle"]
+    target = ["target"]
 
-    # Makes overlapping windows of data (with targets as n+1) then converts to tensors that live on CPU
-    lookback = 256
-    x_seq_train_torch, y_seq_train_torch = make_windows(x_train_scaled_np, y_train, lookback=lookback, horizon=1, stride=1, as_torch=True)
-    x_seq_val_torch, y_seq_val_torch = make_windows(x_val_scaled_np, y_val, lookback=lookback, horizon=1, stride=1, as_torch=True)
+    x = df[features].to_numpy(dtype=np.float32)
+    y = df[target].to_numpy(dtype=np.float32).squeeze(-1)  # (N,) not (N, 1)
 
-    return x_seq_train_torch, y_seq_train_torch, x_seq_val_torch, y_seq_val_torch, scaler
+    # Temporal split
+    split = int(config["train_frac"] * len(df))
+    x_train, x_val = x[:split], x[split:]
+    y_train, y_val = y[:split], y[split:]
 
-def create_dataloaders(data_ref, config, g):
+    # Scale inputs on train statistics only
+    scaler = StandardScaler().fit(x_train)
+    x_train = scaler.transform(x_train)
+    x_val = scaler.transform(x_val)
 
-    ######################################################################
-    # Create dataloaders
-    ######################################################################
-    X_train, y_train, X_val, y_val, scaler = data_ref # Pull out data from Ray store
+    # Sliding windows
+    X_train, Y_train = make_windows(x_train, y_train, config["lookback"], config["horizon"])
+    X_val, Y_val = make_windows(x_val, y_val, config["lookback"], config["horizon"])
 
-    # Create data loaders for batching
+    print(f"Train windows: {X_train.shape}  |  Val windows: {X_val.shape}")
+
+    # Fix the random generator so window shuffle order is reproducible
+    g = torch.Generator()
+    g.manual_seed(config["seed"])
+
     train_loader = DataLoader(
-        TensorDataset(X_train, y_train),
-        batch_size=int(config["batch_size"]),
-        shuffle=True,                       # We want random mini batches so GD doesn't overfit to specific ordering patterns, lets shuffle
-        generator=g,                        # Fixes the shuffle
-        num_workers=0,                      # Eliminate worker non-determinism
-        pin_memory=True,                    # Batches are allocated on page-locked ("pinned") memory on the host, allows GPU driver to perform faster async DMA
-        )  
-    
+        TensorDataset(X_train, Y_train),
+        batch_size=config["batch_size"],
+        shuffle=True,
+        generator=g,
+        num_workers=0,
+        pin_memory=True,
+    )
     val_loader = DataLoader(
-        TensorDataset(X_val, y_val),
-        batch_size=int(config["batch_size"]),
-        shuffle=False,                      # In eval we aren't updating the weights, so it doesn't really matter if we imply ordering or not
-        num_workers=0,                      # Eliminate worker non-determinism
-        pin_memory=True,                    # Batches are allocated on page-locked ("pinned") memory on the host, allows GPU driver to perform faster async DMA
-        )       
-
+        TensorDataset(X_val, Y_val),
+        batch_size=config["batch_size"],
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True,
+    )
     return train_loader, val_loader
 
-def create_lstm_model(device, config):
 
-    model = LSTMRegressor(
-        input_size=3,
-        hidden_size=int(config["hidden_size"]),
-        num_layers=int(config["num_layers"]),
-        dropout=float(config["dropout"]),
-        ).to(device)
+# =============================================================================
+# Training loop
+# =============================================================================
 
-    return model
 
-def train_epoch(model, device, criterion, optimizer, train_loader) -> float:
+def train_model(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    device: torch.device,
+    epochs: int = 300,
+    lr: float = 1e-3,
+    clip_grad: float | None = None,
+    use_scheduler: bool = False,
+) -> tuple[list, list, float]:
+    """
+    Train a model and return performance histories.
 
-    model.train()                   # Setting some dropout layers to go to 0 to prevent overfitting & normalize activations of previous layer
-    train_loss_sum = 0.0            # For each epoch we want to zero out the training loss since we are starting fresh on the dataset
-    n = 0
-    for xb, yb in train_loader:
-        # allows CPU to to continue exec'ing code while data transfer to GPU goes concurrently (requires CPU pinned memory)
-        xb = xb.to(device, non_blocking=True)
-        yb = yb.to(device, non_blocking=True)
-        optimizer.zero_grad()       # For each batch we compute loss and take the gradient of that to update model weights, then make a model update, so zero out gradients from prior batch
-        preds = model(xb)           # Forward pass of predictions, this does the call forward fcn
-        loss = criterion(preds, yb) # Computes loss of predictions vs actuals, this is the average loss over the batch
-        loss.backward()             # Backpropagation, computes gradients of loss w.r.t. each model parameter and stores in param.grad
-        optimizer.step()            # Reads gradients and updates model params based on optimizer config (learning rate, etc)
-        train_loss_sum += loss.item() * xb.size(0)  # Want the sum of loss over samples, because at end of training we divide by total samples to get exact dataset loss, even when last batch may not be exactly batch size
-        n += xb.size(0)             # We want to record number of batches we went through, since we may decide to break out early or something
-    train_loss = train_loss_sum / n  # We divide the accumualted loss for the batch by the number of batches we actually got through
+    Args:
+        model:          any model with forward(x: (B,T,F)) -> (B,1)
+        train_loader:   training DataLoader
+        val_loader:     validation DataLoader
+        device:         torch.device
+        epochs:         number of training epochs
+        lr:             initial Adam learning rate
+        clip_grad:      if set, apply gradient clipping with this max_norm
+        use_scheduler:  if True, halve lr when val RMSE stops improving
 
-    return train_loss
+    Returns:
+        train_rmse_history: list of per-epoch training RMSE values
+        val_rmse_history:   list of per-epoch validation RMSE values
+        wall_clock_seconds: total training time
+    """
+    model.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.MSELoss()
 
-def validate_epoch(model, device, criterion, optimizer, val_loader) -> float:
-    model.eval()                   # Disable droput layers and activation normalization
-    val_loss_sum = 0.0             # Zero out validation loss for each epoch
-    n = 0
-    with torch.no_grad():          # We aren't updating weights, so we don't need to compute gradients, this saves memory and computations
-        for xb, yb in val_loader:
-            xb = xb.to(device, non_blocking=True)  # non_blocking allows CPU to to continue exec'ing code while data transfer to GPU goes concurrently (requires CPU pinned memory)
+    scheduler = None
+    if use_scheduler:
+        # Halve the LR when val RMSE hasn't improved for 20 epochs
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=20, min_lr=1e-5)
+
+    best_val_rmse = float("inf")
+    best_state = None
+    train_hist: list[float] = []
+    val_hist: list[float] = []
+
+    t_start = time.time()
+
+    for epoch in range(1, epochs + 1):
+        # ------------------------------------------------------------------
+        # Training phase
+        # ------------------------------------------------------------------
+        model.train()
+        total_loss = 0.0
+        total_n = 0
+
+        for xb, yb in train_loader:
+            xb = xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True)
+
+            optimizer.zero_grad()
             preds = model(xb)
             loss = criterion(preds, yb)
-            val_loss_sum += loss.item() * xb.size(0)
-            n += xb.size(0) # We want to record number of batches we went through, since we may decide to break out early or somethin
-    val_loss = val_loss_sum / n  # We divide the accumualted loss for the batch by the number of batches we actually got through
+            loss.backward()
 
-    return val_loss
+            if clip_grad is not None:
+                # Clip the L2 norm of all parameter gradients to prevent
+                # exploding gradients (common with deep/recurrent models)
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad)
 
-def train_trial(config, data_ref, base_seed):
+            optimizer.step()
 
-    # Set seeds
-    random.seed(base_seed)
-    np.random.seed(base_seed)
-    torch.manual_seed(base_seed)
-    g = torch.Generator()    # Creates a generator that fixes the shuffle in torch Dataloader
-    g.manual_seed(base_seed)
+            # Accumulate loss weighted by batch size (batches may differ in size)
+            total_loss += loss.item() * xb.size(0)
+            total_n += xb.size(0)
 
-    # Create dataloaders
-    train_loader, val_loader = create_dataloaders(data_ref, config, g)
-   
-    ######################################################################
-    # Create model, loss, optimizer
-    ######################################################################
-    device = torch.device("cuda")   # this is the Ray-assigned GPU (Ray sets CUDA_VISIBLE_DEVICES)
-    criterion = torch.nn.MSELoss()
-    
-    # LSTM model
-    model = create_lstm_model(device, config)
+        # RMSE = sqrt(mean squared error over all training samples)
+        train_rmse = math.sqrt(total_loss / total_n)
+        train_hist.append(train_rmse)
 
-    # Adapative moment estimation, makes sure we step opposite smoothed gradient and shrink/grow step based on how noisy each model parameter's gradient has been
-    optimizer = torch.optim.Adam(model.parameters())
+        # ------------------------------------------------------------------
+        # Validation phase
+        # ------------------------------------------------------------------
+        model.eval()
+        total_loss = 0.0
+        total_n = 0
 
-    ######################################################################
-    # Training Loop
-    ######################################################################
-    epochs = int(config["epochs"])
-    train_rmse_hist, val_rmse_hist = [], []
-    for epoch in range(1, epochs + 1):
-        # Training
-        train_loss = train_epoch(model, device, criterion, optimizer, train_loader)
-       
-        # Validation
-        val_loss = validate_epoch(model, device, criterion, optimizer, val_loader)
-     
-        # Create performance metrics
-        train_rmse = float(np.sqrt(train_loss))
-        val_rmse   = float(np.sqrt(val_loss))
-        train_rmse_hist.append(train_rmse)
-        val_rmse_hist.append(val_rmse)
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb = xb.to(device, non_blocking=True)
+                yb = yb.to(device, non_blocking=True)
+                preds = model(xb)
+                loss = criterion(preds, yb)
+                total_loss += loss.item() * xb.size(0)
+                total_n += xb.size(0)
 
-        ######################################################################
-        # Tune logging (with MLflow callaback this is all mirrored there as well)
-        # NOTE: By calling tune.report here effectively once per epoch, that becomes our time scale!
-        ######################################################################
-        # Report metrics and save checkpoint if applicable (checkpoint every n epochs and don't have redudant checkpoints if using workers via train)
-        checkpoint = None
-        should_checkpoint = epoch % config.get("checkpoint_freq", 1) == 0
+        val_rmse = math.sqrt(total_loss / total_n)
+        val_hist.append(val_rmse)
 
-        # NOTE: In standard DDP training, where the model is the same across all ranks, only the global rank 0 worker needs to save and report the checkpoint
-        if should_checkpoint: # add in tune.get_context().get_world_rank() == 0 when workers implemented
+        if scheduler is not None:
+            scheduler.step(val_rmse)
 
-            # Create the checkpoint dir
-            session   = tune.get_context()
-            trial_dir = Path(session.get_trial_dir())
-            ckpt_dir = trial_dir / f"ckpt_e{epoch:04d}"
-            ckpt_dir.mkdir(parents=True, exist_ok=True)
+        # Save the model weights whenever validation RMSE improves
+        if val_rmse < best_val_rmse:
+            best_val_rmse = val_rmse
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
-            # Save the model
-            torch.save(model.state_dict(), ckpt_dir / "model.pt")
+        if epoch % 50 == 0:
+            print(f"  Epoch {epoch:3d} | train RMSE: {train_rmse:.4f} | val RMSE: {val_rmse:.4f}")
 
-            # Save loss plot
-            matplotlib.use("Agg") # Matplotlib runs headless
-            import matplotlib.pyplot as plt
-            fig = plt.figure()
-            plt.plot(range(1, epoch + 1), train_rmse_hist, label="train_rmse")
-            plt.plot(range(1, epoch + 1), val_rmse_hist,   label="val_rmse")
-            plt.xlabel("Epoch"); plt.ylabel("RMSE"); plt.title("Training/Validation RMSE")
-            plt.legend(); plt.tight_layout()
-            plt.savefig(ckpt_dir / "loss_curve.png", dpi=150)
-            plt.close(fig)
+    wall_clock = time.time() - t_start
 
-            # Save scaler
-            joblib.dump(scaler, ckpt_dir / "standard_scaler.pkl")
+    # Restore the best checkpoint found during training
+    model.load_state_dict(best_state)
 
-            # Create checkpoint
-            ckpt = Checkpoint.from_directory(str(ckpt_dir))
+    return train_hist, val_hist, wall_clock
 
-        # We want to report metrics every epoch regardless if we are checkpointing
-        metrics = {
-            "val_rmse": float(val_rmse_hist[-1]),
-            "train_rmse": float(train_rmse_hist[-1]),
-            "epoch": int(epochs),
+
+# =============================================================================
+# Utilities
+# =============================================================================
+
+
+def count_params(model: nn.Module) -> int:
+    """Count the number of trainable parameters in a model."""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+# =============================================================================
+# Plotting
+# =============================================================================
+
+
+def plot_losses(
+    name: str,
+    train_rmse: list[float],
+    val_rmse: list[float],
+    out_dir: str | os.PathLike[str],
+) -> None:
+    """Save a train/val RMSE curve for a single model."""
+    epochs = range(1, len(train_rmse) + 1)
+    best = min(val_rmse)
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(epochs, train_rmse, label="Train RMSE", linewidth=1.2)
+    ax.plot(epochs, val_rmse, label="Val RMSE", linewidth=1.2)
+    ax.set_title(f"{name} -- best val RMSE: {best:.4f}")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("RMSE")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    path = os.path.join(out_dir, f"{name}_loss.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved {path}")
+
+
+def plot_summary(results: dict, out_dir: str | os.PathLike[str]) -> None:
+    """
+    Save a 3x2 comparison figure across all models.
+
+    Rows:
+        0 -- Training RMSE curves (full run + zoomed to last 100 epochs)
+        1 -- Validation RMSE curves (full run + zoomed to last 100 epochs)
+        2 -- Bar charts: best val RMSE and training time
+    """
+    model_names = list(results.keys())
+    colors = ["tab:blue", "tab:orange", "tab:green", "tab:red"]
+    n_epochs = len(next(iter(results.values()))["train_losses"])
+    epochs_full = range(1, n_epochs + 1)
+    zoom_start = max(1, n_epochs - 99)  # last 100 epochs
+    epochs_zoom = range(zoom_start, n_epochs + 1)
+
+    fig, axes = plt.subplots(3, 2, figsize=(14, 12))
+    fig.suptitle("Model Comparison -- Time Series Forecasting", fontsize=13, y=1.01)
+
+    # Row 0: Training RMSE
+    for name, color in zip(model_names, colors, strict=False):
+        axes[0, 0].plot(epochs_full, results[name]["train_losses"], label=name, color=color, linewidth=1.0)
+        axes[0, 1].plot(
+            epochs_zoom,
+            results[name]["train_losses"][zoom_start - 1 :],
+            label=name,
+            color=color,
+            linewidth=1.0,
+        )
+
+    for ax, title in zip(axes[0], ["Training RMSE", "Training RMSE (last 100 epochs)"], strict=False):
+        ax.set_title(title)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("RMSE")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+    # Row 1: Validation RMSE
+    for name, color in zip(model_names, colors, strict=False):
+        axes[1, 0].plot(epochs_full, results[name]["val_losses"], label=name, color=color, linewidth=1.0)
+        axes[1, 1].plot(
+            epochs_zoom,
+            results[name]["val_losses"][zoom_start - 1 :],
+            label=name,
+            color=color,
+            linewidth=1.0,
+        )
+
+    for ax, title in zip(axes[1], ["Validation RMSE", "Validation RMSE (last 100 epochs)"], strict=False):
+        ax.set_title(title)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("RMSE")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+    # Row 2: Bar charts
+    best_rmses = [results[n]["best_val_rmse"] for n in model_names]
+    train_times = [results[n]["train_time"] for n in model_names]
+
+    bars = axes[2, 0].bar(model_names, best_rmses, color=colors)
+    axes[2, 0].set_title("Best Validation RMSE  (lower is better)")
+    axes[2, 0].set_ylabel("RMSE")
+    axes[2, 0].bar_label(bars, fmt="%.4f", padding=3)
+    axes[2, 0].grid(True, alpha=0.3, axis="y")
+
+    bars = axes[2, 1].bar(model_names, train_times, color=colors)
+    axes[2, 1].set_title("Training Time  (seconds)")
+    axes[2, 1].set_ylabel("Seconds")
+    axes[2, 1].bar_label(bars, fmt="%.1f", padding=3)
+    axes[2, 1].grid(True, alpha=0.3, axis="y")
+
+    plt.tight_layout()
+    path = os.path.join(out_dir, "comparison.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"\nSaved {path}")
+
+
+def print_summary_table(results: dict) -> None:
+    """Print a formatted summary table to stdout."""
+    header = f"{'Model':<18} {'Params':>10} {'Best Val RMSE':>14} {'Train Time (s)':>15} {'Epochs':>7}"
+    print(f"\n{header}")
+    print("-" * len(header))
+    for name, r in results.items():
+        print(f"{name:<18} {r['param_count']:>10,} {r['best_val_rmse']:>14.4f} {r['train_time']:>15.1f} {r['epochs']:>7}")
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+
+def main() -> None:
+    # Reproducibility
+    torch.manual_seed(CONFIG["seed"])
+    np.random.seed(CONFIG["seed"])
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    # Output directory
+    os.makedirs(CONFIG["artifacts"], exist_ok=True)
+
+    # Data
+    train_loader, val_loader = load_data(CONFIG)
+
+    # Model registry -- each entry specifies the model and its training recipe.
+    # clip_grad and use_scheduler are only applied where the architecture needs them.
+    models_cfg = [
+        {
+            "name": "NaiveLSTM",
+            "model": NaiveLSTM(input_size=3),
+            "clip_grad": None,
+            "use_scheduler": False,
+        },
+        {
+            "name": "ImprovedLSTM",
+            "model": ImprovedLSTM(input_size=3),
+            "clip_grad": 1.0,  # prevent exploding gradients in deep LSTM
+            "use_scheduler": True,  # halve LR when val RMSE plateaus
+        },
+        {
+            "name": "Transformer",
+            "model": TimeSeriesTransformer(input_size=3),
+            "clip_grad": None,
+            "use_scheduler": False,
+        },
+        {
+            "name": "TCN",
+            "model": TCN(input_size=3),
+            "clip_grad": None,
+            "use_scheduler": False,
+        },
+    ]
+
+    results: dict = {}
+    for cfg in models_cfg:
+        name = cfg["name"]
+        model = cfg["model"]
+        print(f"\n{'=' * 52}\nTraining: {name}  ({count_params(model):,} parameters)")
+
+        train_hist, val_hist, elapsed = train_model(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            device=device,
+            epochs=CONFIG["epochs"],
+            lr=CONFIG["lr"],
+            clip_grad=cfg["clip_grad"],
+            use_scheduler=cfg["use_scheduler"],
+        )
+
+        results[name] = {
+            "train_losses": train_hist,
+            "val_losses": val_hist,
+            "train_time": elapsed,
+            "param_count": count_params(model),
+            "best_val_rmse": min(val_hist),
+            "epochs": CONFIG["epochs"],
         }
-        tune.report(metrics, checkpoint=checkpoint)
 
-        # Status for screen
-        if epoch % 10 == 0:
-            logging.info(f"Epoch {epoch:02d} | train RMSE: {train_rmse:.6f} | val RMSE: {val_rmse:.6f}")
-            
-def run_HPO(data_ref, seed):
+        print(f"  -> Best val RMSE: {min(val_hist):.4f} | Time: {elapsed:.1f}s")
+        plot_losses(name, train_hist, val_hist, CONFIG["artifacts"])
 
-    #ray.init(local_mode=True, log_to_driver=True, ignore_reinit_error=True)
+    plot_summary(results, CONFIG["artifacts"])
+    print_summary_table(results)
 
-    ######################################################################
-    # Start parent HPO, MLflow session
-    ######################################################################
-    mlflow_tracking_uri = f"file:{os.path.abspath('./log/mlruns')}"  # absolute path
-    experiment   = "scratch"
-
-    ######################################################################
-    # Define search space and scheduler
-    ######################################################################
-    lstm_params = {
-        # Model shape
-        "hidden_size": tune.choice([32, 64, 128, 256]),
-        "num_layers": tune.choice([1, 2]),
-        "dropout": tune.choice([0.0, 0.1, 0.2]) ,
-
-        # Training
-        "batch_size": tune.choice([32, 64, 128]),
-
-        # Epochs / checkpointing
-        "epochs": 50,
-        "checkpoint_freq": 5,
-    }
-
-    params=lstm_params
-
-    # Async Successive Halfing Scheduler (ASHA)
-    # Instead of running all trials for all epochs, it allocates more resources to promising ones and kills of bad ones early
-    scheduler = ASHAScheduler(
-        max_t=params["epochs"],                     # Max amount of "things" on our whatever our scale is (since we call tune.report once per epoch this max epochs per trial)
-        grace_period=params["checkpoint_freq"]+1,   # Allow for 51 epochs each trial until we kill it
-        reduction_factor=2,                         # ASHA keeps about 50% of the top trials each time it prunes
-    )
-    
-    ######################################################################
-    # Build tuner; pass MLflow context and PARENT RUN ID to workers via env vars
-    ######################################################################
-    trainable = tune.with_parameters(train_trial, data_ref=data_ref, base_seed=base_seed)  # Allows each training run to get training data from shared object store and random seed
-    tuner = Tuner(
-        tune.with_resources(trainable, resources={"cpu": 4, "gpu": 1}),                  # Gives 4 CPU and one GPU per trial
-        param_space=params,
-        tune_config=TuneConfig( 
-            metric="val_rmse",
-            mode="min",                 # Minimize RMSE
-            scheduler=scheduler,
-            num_samples=100,            # total trials
-        ),
-        run_config=RunConfig(
-            name="lstm_hpo",
-            storage_path=os.path.abspath("./log/ray_results"),
-            failure_config=FailureConfig(fail_fast=True),
-            callbacks=[
-                MLflowLoggerCallback(
-                    tracking_uri=mlflow_tracking_uri,
-                    experiment_name=experiment,
-                    save_artifact=True,
-                )
-            ],
-        ),
-    )
-
-    ######################################################################
-    # Execute HPO
-    ######################################################################
-    results = tuner.fit()
-    best = results.get_best_result(metric="val_rmse", mode="min")
-    print("Best config:", best.config)
 
 if __name__ == "__main__":
-
-    # TODO: https://docs.ray.io/en/latest/train/user-guides/hyperparameter-optimization.html#train-tune
-    # Right now I'm just using Tune and doing a sweep such that each trial get 4 CPU and 1 GPU to train on
-    # We could do Tune --> Train --> Workers such that one trial then gets picked up Train such that we can use multiple workers to train for that (multuple GPUs, etc)
-
-    # Setup logging
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
-    # Set seed the get data and store it common share
-    ray.init()
-    base_seed = 42
-    x_train, y_train, x_val, y_val, scaler = transform_data(base_seed)
-    data_ref = ray.put((x_train, y_train, x_val, y_val, scaler))              # Puts data into Ray's object store which each trial can access
-
-    # Run hyperparameter optimization
-    run_HPO(data_ref, base_seed)
-
-
+    main()
