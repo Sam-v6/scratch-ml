@@ -7,6 +7,7 @@ Usage (from repo root):
 Outputs written to SCRATCH_HOME/artifacts/:
     {ModelName}_loss.png  -- per-model train/val RMSE curves
     comparison.png        -- 3x2 summary figure across all models
+    inference_comparison.png -- 2x2 actual vs prediction overlays (holdout)
 
 A summary table is also printed to stdout.
 """
@@ -23,6 +24,7 @@ import torch.nn as nn
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
 
+from generate import generate_synthetic_dataframe
 from models import TCN, ImprovedLSTM, NaiveLSTM, TimeSeriesTransformer
 from path import SCRATCH_HOME
 
@@ -40,6 +42,11 @@ CONFIG = {
     "epochs": 100,
     "lr": 1e-3,
     "seed": 42,
+    "inference_holdout_enabled": True,
+    "inference_duration_s": 20.0,
+    "inference_fs": 100,
+    "inference_seed": 123,
+    "inference_plot_path": SCRATCH_HOME / "artifacts" / "inference_comparison.png",
 }
 
 
@@ -75,7 +82,7 @@ def make_windows(
     return X, Y
 
 
-def load_data(config: dict) -> tuple[DataLoader, DataLoader]:
+def load_data(config: dict) -> tuple[DataLoader, DataLoader, StandardScaler]:
     """
     Load the CSV, scale features, build sliding windows, and return DataLoaders.
 
@@ -130,7 +137,7 @@ def load_data(config: dict) -> tuple[DataLoader, DataLoader]:
         num_workers=0,
         pin_memory=True,
     )
-    return train_loader, val_loader
+    return train_loader, val_loader, scaler
 
 
 # =============================================================================
@@ -262,6 +269,59 @@ def count_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
+@torch.no_grad()
+def predict_ordered_windows(model: nn.Module, X: torch.Tensor, device: torch.device) -> np.ndarray:
+    """Run model inference in chronological order over window tensor X."""
+    model.eval()
+    X = X.to(device)
+    preds = model(X).squeeze(-1).detach().cpu().numpy()
+    return preds
+
+
+def infer_on_dataframe(
+    model: nn.Module,
+    df: pd.DataFrame,
+    scaler: StandardScaler,
+    lookback: int,
+    horizon: int,
+    device: torch.device,
+) -> dict[str, np.ndarray | float]:
+    """
+    Run ordered inference over a full dataframe and align predictions to real time.
+
+    Assumes horizon=1 to produce a single target value per window.
+    """
+    if horizon != 1:
+        raise ValueError("Inference plotting currently supports only horizon=1.")
+
+    x = df[["sine", "square", "triangle"]].to_numpy(dtype=np.float32)
+    y = df["target"].to_numpy(dtype=np.float32)
+
+    if len(df) < lookback + horizon:
+        raise ValueError(f"Holdout sequence too short: need at least {lookback + horizon} samples, got {len(df)}.")
+
+    x_scaled = scaler.transform(x)
+    X_seq, Y_seq = make_windows(x_scaled, y, lookback, horizon)
+    y_true = Y_seq.squeeze(-1).cpu().numpy()
+    y_pred = predict_ordered_windows(model, X_seq, device)
+
+    time = df["time"].to_numpy(dtype=np.float32)
+    t_idx = np.arange(lookback, lookback + len(y_pred))
+
+    rmse = float(np.sqrt(np.mean((y_pred - y_true) ** 2)))
+    nrmse_pct = float((rmse / df["target"].mean()) * 100.0)
+
+    return {
+        "time": time,
+        "target": y,
+        "t_idx": t_idx,
+        "y_true": y_true,
+        "y_pred": y_pred,
+        "rmse": rmse,
+        "nrmse_pct": nrmse_pct,
+    }
+
+
 # =============================================================================
 # Plotting
 # =============================================================================
@@ -380,6 +440,34 @@ def print_summary_table(results: dict) -> None:
         print(f"{name:<18} {r['param_count']:>10,} {r['best_val_rmse']:>14.4f} {r['train_time']:>15.1f} {r['epochs']:>7}")
 
 
+def plot_inference_subplots(results: dict, out_path: str | os.PathLike[str]) -> None:
+    """Save a 2x2 figure with actual-vs-prediction overlays for all models."""
+    model_order = ["NaiveLSTM", "ImprovedLSTM", "Transformer", "TCN"]
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10), sharex=True, sharey=True)
+    fig.suptitle("Holdout Inference -- Actual vs Model Prediction", fontsize=13, y=1.01)
+
+    for ax, name in zip(axes.ravel(), model_order, strict=False):
+        infer = results[name]["inference"]
+        time = infer["time"]
+        target = infer["target"]
+        t_idx = infer["t_idx"]
+        y_pred = infer["y_pred"]
+
+        ax.plot(time, target, label="Actual", linewidth=1.5, alpha=0.4)
+        ax.plot(time[t_idx], y_pred, label="Prediction", linewidth=1.0, color="tab:red")
+        ax.set_title(f"{name} | RMSE: {infer['rmse']:.4f} V | nRMSE: {infer['nrmse_pct']:.2f}%")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Voltage (V)")
+        ax.set_ylim(1, 5)
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"\nSaved {out_path}")
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -397,7 +485,7 @@ def main() -> None:
     os.makedirs(CONFIG["artifacts"], exist_ok=True)
 
     # Data
-    train_loader, val_loader = load_data(CONFIG)
+    train_loader, val_loader, scaler = load_data(CONFIG)
 
     # Model registry -- each entry specifies the model and its training recipe.
     # clip_grad and use_scheduler are only applied where the architecture needs them.
@@ -458,6 +546,28 @@ def main() -> None:
         plot_losses(name, train_hist, val_hist, CONFIG["artifacts"])
 
     plot_summary(results, CONFIG["artifacts"])
+
+    if CONFIG["inference_holdout_enabled"]:
+        holdout_df = generate_synthetic_dataframe(
+            duration_s=CONFIG["inference_duration_s"],
+            fs=CONFIG["inference_fs"],
+            seed=CONFIG["inference_seed"],
+        )
+
+        for cfg in models_cfg:
+            name = cfg["name"]
+            model = cfg["model"]
+            results[name]["inference"] = infer_on_dataframe(
+                model=model,
+                df=holdout_df,
+                scaler=scaler,
+                lookback=CONFIG["lookback"],
+                horizon=CONFIG["horizon"],
+                device=device,
+            )
+
+        plot_inference_subplots(results, CONFIG["inference_plot_path"])
+
     print_summary_table(results)
 
 
