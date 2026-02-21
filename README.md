@@ -297,9 +297,16 @@ This will:
 1. Print per-epoch progress every 50 epochs for each model
 2. Save individual loss curves to `artifacts/{ModelName}_loss.png`
 3. Save a 6-panel comparison figure to `artifacts/comparison.png`
-4. Print a summary table with parameter counts, best val RMSE, and training times
+4. Generate a synthetic holdout and save a 2x2 inference overlay figure to `artifacts/inference_comparison.png`
+5. Print a summary table with parameter counts, best val RMSE, and training times
 
 All hyperparameters are in the `CONFIG` dict at the top of `src/train.py`.
+Inference holdout controls are under:
+- `CONFIG["inference_holdout_enabled"]`
+- `CONFIG["inference_duration_s"]`
+- `CONFIG["inference_fs"]`
+- `CONFIG["inference_seed"]`
+- `CONFIG["inference_plot_path"]`
 
 ---
 
@@ -319,48 +326,35 @@ Latest committed run (100 epochs):
 ## Repository Structure
 
 ```text
-❯ lt
-├──  artifacts
-│  ├──  comparison.png
-│  ├──  ImprovedLSTM_loss.png
-│  ├──  NaiveLSTM_loss.png
-│  ├──  TCN_loss.png
-│  └──  Transformer_loss.png
-├──  data
-│  └──  input
-│     ├──  data_signals.csv
-│     └──  data_signals.png
-├──  LICENSE
-├──  notebooks
-│  └──  explore.ipynb
-├──  pyproject.toml
-├──  README.md
-├──  src
-│  ├──  __init__.py
-│  ├──  __pycache__
-│  │  ├──  improved_lstm.cpython-312.pyc
-│  │  ├──  lstm.cpython-312.pyc
-│  │  ├──  models.cpython-312.pyc
-│  │  ├──  naive_lstm.cpython-312.pyc
-│  │  ├──  path.cpython-312.pyc
-│  │  ├──  tcn.cpython-312.pyc
-│  │  └──  transformer.cpython-312.pyc
-│  ├──  generate.py
-│  ├──  models
-│  │  ├──  __init__.py
-│  │  ├──  __pycache__
-│  │  │  ├──  __init__.cpython-312.pyc
-│  │  │  ├──  improved_lstm.cpython-312.pyc
-│  │  │  ├──  naive_lstm.cpython-312.pyc
-│  │  │  ├──  tcn.cpython-312.pyc
-│  │  │  └──  transformer.cpython-312.pyc
-│  │  ├──  improved_lstm.py
-│  │  ├──  naive_lstm.py
-│  │  ├──  tcn.py
-│  │  └──  transformer.py
-│  ├──  path.py
-│  └──  train.py
-└──  uv.lock
+.
+|-- LICENSE
+|-- README.md
+|-- pyproject.toml
+|-- uv.lock
+|-- artifacts
+|   |-- comparison.png
+|   |-- inference_comparison.png
+|   |-- ImprovedLSTM_loss.png
+|   |-- NaiveLSTM_loss.png
+|   |-- TCN_loss.png
+|   `-- Transformer_loss.png
+|-- data
+|   `-- input
+|       |-- data_signals.csv
+|       `-- data_signals.png
+|-- notebooks
+|   `-- explore.ipynb
+`-- src
+    |-- __init__.py
+    |-- generate.py
+    |-- path.py
+    |-- train.py
+    `-- models
+        |-- __init__.py
+        |-- improved_lstm.py
+        |-- naive_lstm.py
+        |-- tcn.py
+        `-- transformer.py
 ```
 
 Note: this tree uses plain ASCII to render reliably in Markdown preview. If you use `lt`/`lsd`, disable icons before pasting output into docs.
