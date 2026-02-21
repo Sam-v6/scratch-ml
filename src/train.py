@@ -9,15 +9,24 @@ Outputs written to SCRATCH_HOME/artifacts/:
     comparison.png        -- 3x2 summary figure across all models
     inference_comparison.png -- 2x2 actual vs prediction overlays (holdout)
 
+Outputs written to SCRATCH_HOME/artifacts/onnx/:
+    {ModelName}.onnx      -- traced ONNX graph for each model
+    holdout_input.bin     -- float32 input windows for C++ benchmark
+    holdout_target.bin    -- float32 target values for C++ benchmark
+    holdout_meta.json     -- window shape metadata
+
 A summary table is also printed to stdout.
 """
 
+import json
 import math
 import os
 import time
 
 import matplotlib.pyplot as plt
 import numpy as np
+import onnx
+import onnxruntime as ort
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -47,6 +56,10 @@ CONFIG = {
     "inference_fs": 100,
     "inference_seed": 123,
     "inference_plot_path": SCRATCH_HOME / "artifacts" / "inference_comparison.png",
+    # ONNX export
+    "onnx_export_enabled": True,
+    "onnx_dir": SCRATCH_HOME / "artifacts" / "onnx",
+    "onnx_opset": 17,
 }
 
 
@@ -323,6 +336,130 @@ def infer_on_dataframe(
 
 
 # =============================================================================
+# ONNX Export
+# =============================================================================
+
+
+def export_model_onnx(
+    name: str,
+    model: nn.Module,
+    out_dir: str | os.PathLike[str],
+    opset_version: int = 17,
+) -> None:
+    """
+    Export the model to ONNX and write {name}.onnx to out_dir.
+
+    Uses the dynamo-based exporter (torch.onnx.export with dynamo=True, backed
+    by torch.export rather than TorchScript tracing).  fallback=True is set so
+    that if the dynamo translator encounters an unsupported prims op (a known
+    onnxscript limitation for LSTM/weight_norm/Transformer graphs), it retries
+    with the legacy TorchScript path automatically.  The input shape is fully
+    static at (1, 256, 3) -- batch_size=1 matches single-window C++ inference.
+
+    Noise suppressed intentionally:
+      - DeprecationWarning for the legacy path: moot because dynamo=True was the
+        explicit first attempt; the fallback is an implementation detail.
+      - UserWarning about LSTM batch_size: false-positive -- we export with a
+        static batch_size=1, not a variable-length sequence.
+      - torch.onnx logger ERROR messages: the fallback mechanism logs the dynamo
+        conversion errors (prims.empty_strided, prims.collapse_view, etc.) at
+        ERROR level before retrying; they are expected and not actionable.
+
+    After export the graph is validated with onnx.checker and a round-trip
+    forward pass via onnxruntime verifies the output shape.
+    """
+    import warnings
+
+    # Save the device so the model can be restored after export
+    original_device = next(model.parameters()).device
+    model.eval()
+    model.cpu()  # keep model on CPU so it matches the CPU dummy tensor
+
+    dummy = torch.zeros(1, 256, 3)  # (B=1, T=256, F=3)
+    out_path = os.path.join(out_dir, f"{name}.onnx")
+
+    with warnings.catch_warnings():
+        # DeprecationWarning for the legacy fallback path -- moot because dynamo=True
+        # was the explicit first attempt; the fallback is an implementation detail.
+        warnings.filterwarnings("ignore", category=DeprecationWarning)
+        # UserWarning about LSTM batch_size -- false-positive; we export batch_size=1.
+        warnings.filterwarnings("ignore", message=".*batch_size.*LSTM.*", category=UserWarning)
+        # UserWarning about constant folding on onnx::Slice -- emitted by the legacy
+        # TorchScript fallback for the Transformer PE slice; the graph is still correct.
+        warnings.filterwarnings("ignore", message=".*Constant folding.*", category=UserWarning)
+        torch.onnx.export(
+            model,
+            (dummy,),
+            f=out_path,
+            dynamo=True,
+            fallback=True,  # retry with TorchScript if a prims op lacks ONNX translation
+            verbose=False,  # suppress [torch.onnx] progress prints and fallback error dump
+            input_names=["input"],
+            output_names=["output"],
+            opset_version=opset_version,
+            external_data=False,  # keep everything in the single .onnx file
+        )
+
+    # Structural validation against the ONNX spec
+    onnx.checker.check_model(out_path)
+
+    # Round-trip check: one forward pass via ORT to verify output shape
+    sess = ort.InferenceSession(out_path, providers=["CPUExecutionProvider"])
+    out = sess.run(None, {"input": dummy.numpy()})
+    assert out[0].shape == (1, 1), f"Unexpected ORT output shape: {out[0].shape}"
+
+    # Restore model to its original device so inference after export still works
+    model.to(original_device)
+
+    print(f"  Exported {name} -> {out_path}")
+
+
+def export_holdout_data(
+    holdout_df: pd.DataFrame,
+    scaler: StandardScaler,
+    lookback: int,
+    horizon: int,
+    out_dir: str | os.PathLike[str],
+) -> None:
+    """
+    Serialise holdout windows to raw binary files for the C++ benchmark binary.
+
+    Applies exactly the same pre-processing as infer_on_dataframe():
+      1. Extract features and target columns
+      2. Scale features using the training scaler
+      3. Build sliding windows via make_windows()
+
+    This guarantees the C++ binary sees bit-identical floats to Python inference.
+
+    Files written to out_dir:
+      holdout_input.bin  -- float32, row-major, shape (N, lookback, n_features)
+      holdout_target.bin -- float32, shape (N,)
+      holdout_meta.json  -- {n_windows, lookback, n_features}
+    """
+    x = holdout_df[["sine", "square", "triangle"]].to_numpy(dtype=np.float32)
+    y = holdout_df["target"].to_numpy(dtype=np.float32)
+
+    x_scaled = scaler.transform(x)
+    X_seq, Y_seq = make_windows(x_scaled, y, lookback, horizon)
+
+    X_np = X_seq.numpy()  # (N, 256, 3), float32, C-contiguous
+    y_np = Y_seq.squeeze(-1).numpy()  # (N,),        float32
+
+    X_np.tofile(os.path.join(out_dir, "holdout_input.bin"))
+    y_np.tofile(os.path.join(out_dir, "holdout_target.bin"))
+
+    meta = {
+        "n_windows": int(X_np.shape[0]),
+        "lookback": lookback,
+        "n_features": int(X_np.shape[2]),
+    }
+    with open(os.path.join(out_dir, "holdout_meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+
+    print(f"  Holdout data: {X_np.shape} input, {y_np.shape} target -> {out_dir}")
+
+
+# =============================================================================
 # Plotting
 # =============================================================================
 
@@ -547,6 +684,14 @@ def main() -> None:
 
     plot_summary(results, CONFIG["artifacts"])
 
+    # ONNX model export -- models are in best state (train_model restores best_state)
+    if CONFIG["onnx_export_enabled"]:
+        onnx_dir = CONFIG["onnx_dir"]
+        os.makedirs(onnx_dir, exist_ok=True)
+        print(f"\n{'=' * 52}\nONNX Export")
+        for cfg in models_cfg:
+            export_model_onnx(cfg["name"], cfg["model"], onnx_dir, CONFIG["onnx_opset"])
+
     if CONFIG["inference_holdout_enabled"]:
         holdout_df = generate_synthetic_dataframe(
             duration_s=CONFIG["inference_duration_s"],
@@ -567,6 +712,16 @@ def main() -> None:
             )
 
         plot_inference_subplots(results, CONFIG["inference_plot_path"])
+
+        # Holdout data export -- nested here so holdout_df is in scope
+        if CONFIG["onnx_export_enabled"]:
+            export_holdout_data(
+                holdout_df=holdout_df,
+                scaler=scaler,
+                lookback=CONFIG["lookback"],
+                horizon=CONFIG["horizon"],
+                out_dir=CONFIG["onnx_dir"],
+            )
 
     print_summary_table(results)
 

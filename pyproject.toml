@@ -16,6 +16,9 @@ dependencies = [
     "matplotlib>=3.10.6",
     "mlflow>=3.4.0",
     "numpy>=2.3.3",
+    "onnx>=1.17.0",
+    "onnxruntime>=1.20.0",
+    "onnxscript>=0.1.0",
     "pandas>=2.3.2",
     "pip-tools>=7.5.0",
     "pre-commit>=4.5.1",
@@ -24,6 +27,7 @@ dependencies = [
     "scipy>=1.16.2",
     "tensorboard>=2.20.0",
     "torch>=2.8.0",
+    "torchvision>=0.23.0",
 ]
 
 [dependency-groups]
@@ -61,4 +65,4 @@ ignore = [
 
 [tool.ruff.lint.isort]
 # Tells isort which modules belong to this project (placed in their own import group)
-known-first-party = ["models", "path"]
+known-first-party = ["generate", "models", "path"]
