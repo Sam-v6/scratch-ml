@@ -287,6 +287,43 @@ uv sync --group dev
 uv run python src/generate.py
 ```
 
+**Run the full inference pipeline (recommended):**
+
+`src/pipeline.py` chains all four steps:
+1. data generation
+2. model training + export (`.pth`, `.pt`, `.onnx`)
+3. C++ build (`inference`, plus `trt_inference` if TensorRT is installed)
+4. unified benchmark (`src/benchmark.py`)
+
+```bash
+# Recommended command
+uv run src/pipeline.py
+```
+
+ONNX Runtime resolution order in `pipeline.py`:
+1. `--ort-root /path/to/onnxruntime`
+2. `ORT_ROOT` environment variable
+3. `$HOME/onnxruntime` (if `include/` + `lib/` are present)
+4. system library search (apt-installed ORT)
+
+Examples:
+
+```bash
+# Explicit ORT tarball location
+uv run src/pipeline.py --ort-root $HOME/onnxruntime
+
+# Same, but from environment variable
+export ORT_ROOT=$HOME/onnxruntime
+uv run src/pipeline.py
+
+# Skip work already done
+uv run src/pipeline.py --skip-generate --skip-train --skip-build
+```
+
+---
+
+**Or run each step individually:**
+
 **Train all four models and produce comparison artifacts:**
 
 ```bash
@@ -298,8 +335,9 @@ This will:
 2. Save individual loss curves to `artifacts/{ModelName}_loss.png`
 3. Save a 6-panel comparison figure to `artifacts/comparison.png`
 4. Generate a synthetic holdout and save a 2x2 inference overlay figure to `artifacts/inference_comparison.png`
-5. Export each model to ONNX and write holdout binary data to `artifacts/onnx/`
-6. Print a summary table with parameter counts, best val RMSE, and training times
+5. Export each model to `.pth` (state dict), `.pt` (TorchScript), and `.onnx` in `artifacts/onnx/`
+6. Write holdout binary data (`holdout_input.bin`, `holdout_target.bin`, `holdout_meta.json`) to `artifacts/onnx/`
+7. Print a summary table with parameter counts, best val RMSE, and training times
 
 All hyperparameters are in the `CONFIG` dict at the top of `src/train.py`.
 Inference holdout controls:
@@ -378,65 +416,55 @@ the sliding windows.  This guarantees C++ sees bit-identical floats to Python.
 
 | File | Description |
 |------|-------------|
-| `NaiveLSTM.onnx` | Traced NaiveLSTM graph |
-| `ImprovedLSTM.onnx` | Traced ImprovedLSTM graph |
-| `Transformer.onnx` | Traced TimeSeriesTransformer graph |
-| `TCN.onnx` | Traced TCN graph |
+| `NaiveLSTM.pth` | State dict (load with model class + `torch.load`) |
+| `ImprovedLSTM.pth` | State dict |
+| `Transformer.pth` | State dict |
+| `TCN.pth` | State dict |
+| `NaiveLSTM.pt` | TorchScript traced graph (`torch.jit.load`, no class needed) |
+| `ImprovedLSTM.pt` | TorchScript traced graph |
+| `Transformer.pt` | TorchScript traced graph |
+| `TCN.pt` | TorchScript traced graph |
+| `NaiveLSTM.onnx` | ONNX graph (opset 17, static input `(1,256,3)`) |
+| `ImprovedLSTM.onnx` | ONNX graph |
+| `Transformer.onnx` | ONNX graph |
+| `TCN.onnx` | ONNX graph |
 | `holdout_input.bin` | Raw float32 input windows, shape (N, 256, 3), row-major |
 | `holdout_target.bin` | Raw float32 targets, shape (N,) |
 | `holdout_meta.json` | `{n_windows, lookback, n_features}` |
+| `{Name}.engine` | Cached TensorRT engine (written by `trt_inference` on first run) |
+| `cpp_metrics.json` | ONNX/ORT C++ latency results |
+| `trt_metrics.json` | TensorRT C++ latency results (GPU only) |
+| `python_metrics.json` | Python .pth and .pt latency results |
 
 ---
 
-## C++ Runtime
+## ONNX Runtime C++ Inference
 
-A standalone C++ binary (`cpp/inference.cpp`) loads each ONNX model via
-ONNX Runtime, reads the holdout data written by Python, and benchmarks
-single-window inference on CPU and GPU (CUDA if available).
+`cpp/inference.cpp` benchmarks all ONNX models on:
+- `CPUExecutionProvider` (always)
+- `CUDAExecutionProvider` (when available)
 
-**What is ONNX Runtime?**
-ONNX Runtime (ORT) is Microsoft's high-performance inference engine for ONNX models.
-It supports multiple execution providers -- CPU, CUDA, TensorRT, CoreML, etc. --
-selectable at session-creation time.  The C++ API (`onnxruntime_cxx_api.h`) provides
-zero-copy tensor creation and is the same API used in production deployments.
+It writes `artifacts/onnx/cpp_metrics.json`.
 
-### System prerequisites
-
-#### Compiler and build tools
-
-You need GCC >= 9 (or Clang >= 10) for C++17 support, CMake >= 3.20, and Git
-(used by CMake's `FetchContent` to download `nlohmann/json` at build time).
-
-Ubuntu / Debian:
+### Install prerequisites
 
 ```bash
 sudo apt update
 sudo apt install -y build-essential cmake git
 ```
 
-`build-essential` installs `gcc`, `g++`, and `make`.  Verify you have compatible
-versions before building:
+### Install ONNX Runtime (choose one)
+
+**Option A: apt deb (CPU only, Ubuntu 24.10+)**
 
 ```bash
-g++ --version      # need >= 9
-cmake --version    # need >= 3.20
-git --version      # any recent version
+sudo apt update
+sudo apt install -y libonnxruntime libonnxruntime-dev
 ```
 
-On Ubuntu 22.04 the default CMake (3.22) and GCC (11) are both sufficient.
-On Ubuntu 20.04, CMake from `apt` is too old (3.16) -- install the snap instead:
+**Option B: GitHub tar.gz (CPU or GPU, any Ubuntu)**
 
-```bash
-sudo snap install cmake --classic
-```
-
-#### ONNX Runtime C++ library
-
-Download the prebuilt release that **matches the Python `onnxruntime` version**
-(`1.24.2` as pinned in `pyproject.toml`).  Use the CPU-only build unless you have
-a CUDA-capable GPU and want GPU benchmarks.
-
-**CPU-only:**
+CPU build:
 
 ```bash
 cd ~
@@ -445,7 +473,7 @@ tar -xf onnxruntime-linux-x64-1.24.2.tgz
 mv onnxruntime-linux-x64-1.24.2 onnxruntime
 ```
 
-**CUDA (GPU) build** -- requires a CUDA-capable GPU and CUDA toolkit installed:
+GPU build:
 
 ```bash
 cd ~
@@ -454,145 +482,163 @@ tar -xf onnxruntime-linux-x64-gpu-1.24.2.tgz
 mv onnxruntime-linux-x64-gpu-1.24.2 onnxruntime
 ```
 
-After extraction `~/onnxruntime/` should contain:
+Expected layout:
 
-```
+```text
 ~/onnxruntime/
-  include/   ← C++ headers (onnxruntime_cxx_api.h, etc.)
-  lib/       ← libonnxruntime.so
+  include/
+  lib/
 ```
 
-#### ONNX artifacts
-
-Run Python training first to produce the `.onnx` model files and holdout binary
-data that the C++ binary reads:
+### Build C++ binaries
 
 ```bash
-uv run python src/train.py
-```
+mkdir -p cpp/build
+cd cpp/build
 
-This writes `artifacts/onnx/NaiveLSTM.onnx`, `ImprovedLSTM.onnx`,
-`Transformer.onnx`, `TCN.onnx`, `holdout_input.bin`, `holdout_target.bin`,
-and `holdout_meta.json`.
+# apt install path (system detection)
+cmake .. -DCMAKE_BUILD_TYPE=Release
 
-### Build
+# OR explicit tarball path
+# cmake .. -DCMAKE_BUILD_TYPE=Release -DORT_ROOT=$HOME/onnxruntime
 
-```bash
-mkdir -p cpp/build && cd cpp/build
-cmake .. -DORT_ROOT=$HOME/onnxruntime -DCMAKE_BUILD_TYPE=Release
 cmake --build . --parallel
 ```
 
-> **Note:** Use `$HOME/onnxruntime` rather than `~/onnxruntime`.  CMake does not
-> expand the `~` shorthand; the `CMakeLists.txt` handles it with a `string(REGEX
-> REPLACE ...)` but using the explicit path avoids any ambiguity.
+Notes:
+- When `ORT_ROOT` points to a tarball install, CMake copies `libonnxruntime*.so*` and provider libs next to the binary.
+- TensorRT target is auto-enabled only if TensorRT headers/libs are present.
 
-CMake downloads `nlohmann/json` (header-only, pinned at v3.11.3) automatically
-via `FetchContent` -- this requires an internet connection during the first
-configure step.  The ONNX Runtime shared library (`libonnxruntime.so`) is copied
-next to the binary after the build so it is found at runtime without having to
-set `LD_LIBRARY_PATH`.
-
-The build output is `cpp/build/inference`.
-
-### Run
-
-From the repository root:
+### Run ONNX C++ inference directly
 
 ```bash
 ./cpp/build/inference artifacts/onnx
 ```
 
-Or pass the ONNX directory explicitly if you put it elsewhere:
+If running directly and using ORT GPU tarball, you may need runtime library paths:
 
 ```bash
-./cpp/build/inference /path/to/artifacts/onnx
+export LD_LIBRARY_PATH="$HOME/onnxruntime/lib:$LD_LIBRARY_PATH"
+./cpp/build/inference artifacts/onnx
 ```
 
-The binary will print per-model progress to stdout and then write the results file:
+Expected output includes CPU and, when configured correctly, CUDA blocks:
 
-```
-ONNX dir: artifacts/onnx
-Holdout: 1744 windows x 256 timesteps x 3 features
-
+```text
 === Provider: CPUExecutionProvider ===
-  NaiveLSTM    ... mean=0.84 ms  p99=1.55 ms  rmse=0.2821
-  ImprovedLSTM ... mean=1.21 ms  p99=2.08 ms  rmse=0.2919
-  Transformer  ... mean=3.47 ms  p99=5.11 ms  rmse=0.2781
-  TCN          ... mean=1.93 ms  p99=3.02 ms  rmse=0.2815
-
-Saved artifacts/onnx/cpp_metrics.json
+...
+=== Provider: CUDAExecutionProvider ===
+...
 ```
 
-If `CUDAExecutionProvider` is available (GPU build + CUDA device present), a
-second `=== Provider: CUDAExecutionProvider ===` block follows automatically.
-If CUDA is not available it is skipped gracefully with a note to stderr.
+If CUDA provider is unavailable, only CPU rows are emitted.
 
-### Profiling methodology
+---
 
-**Warmup:** The first `N_WARMUP = 10` passes are executed before timing begins.
-This lets ORT's JIT compilation, memory allocation, and provider-specific
-initialisation complete outside the measurement window.
+## TensorRT C++ Inference
 
-**Benchmark:** Each of the N holdout windows is run individually at `batch_size=1`.
-Single-window latency is the most meaningful metric for a streaming inference use
-case where predictions must be produced one timestep at a time.  Both
-`IntraOpNumThreads` and `InterOpNumThreads` are set to 1 to eliminate thread-pool
-scheduling jitter and make comparisons between models clean.
+`cpp/trt_inference.cpp` builds/loads TensorRT engines and benchmarks GPU inference only.
+It writes `artifacts/onnx/trt_metrics.json`.
 
-**Latency statistics reported per (model, provider):**
+### Install TensorRT
 
-| Metric | Description |
-|--------|-------------|
-| `mean` | Mean per-window latency (ms) |
-| `min` | Minimum observed latency (ms) |
-| `max` | Maximum observed latency (ms) |
-| `std` | Standard deviation (ms) |
-| `p50` | Median latency (50th percentile, ms) |
-| `p95` | 95th-percentile latency -- important for tail-latency budgets |
-| `p99` | 99th-percentile latency -- worst-case tail |
-
-**Throughput:** Derived from mean latency as `1000 / mean_ms` (windows/second).
-
-**RMSE:** Computed against the Python-exported true targets.  These values should
-closely match the Python holdout RMSE, confirming the ONNX export preserved the
-model weights correctly.
-
-**Peak RSS:** Measured via `getrusage(RUSAGE_SELF)` after the benchmark loop.
-Reports the process high-water mark for resident set size (MB) -- a proxy for
-total memory consumption including the ORT runtime and model weights.
-
-### CPU vs GPU
-
-The binary always benchmarks on `CPUExecutionProvider`.  It probes for
-`CUDAExecutionProvider` via `Ort::GetAvailableProviders()` at startup; if the
-CUDA EP is not compiled into the ORT build or no CUDA device is available, GPU
-benchmarks are skipped gracefully with a message to stderr.
-
-Each (model, provider) pair is wrapped in `try/catch` so a single failure does
-not abort the entire run.
-
-### Output schema
-
-`artifacts/onnx/cpp_metrics.json` -- one entry per (model, provider) pair:
-
-```json
-[
-  {
-    "model": "NaiveLSTM",
-    "provider": "CPUExecutionProvider",
-    "load_time_ms": 45.2,
-    "latency_ms": {
-      "mean": 0.84, "min": 0.71, "max": 2.10,
-      "std": 0.12,  "p50": 0.82, "p95": 1.01, "p99": 1.55
-    },
-    "throughput_windows_per_sec": 1190.5,
-    "rmse": 0.2821,
-    "peak_rss_mb": 142.3,
-    "n_windows": 1488
-  }
-]
+```bash
+sudo apt update
+sudo apt install -y tensorrt tensorrt-dev
 ```
+
+Verify:
+
+```bash
+dpkg -l | grep tensorrt
+ls /usr/include/x86_64-linux-gnu/NvInfer.h
+```
+
+### Build
+
+```bash
+mkdir -p cpp/build
+cd cpp/build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+cmake --build . --parallel
+```
+
+If TensorRT is detected, CMake prints:
+- `TensorRT found -- trt_inference target enabled`
+
+### Run
+
+```bash
+./cpp/build/trt_inference artifacts/onnx
+```
+
+First run builds `.engine` files; later runs reuse cached engines.
+
+---
+
+## Unified Inference Benchmark
+
+`src/benchmark.py` runs:
+- Python `.pth` (CPU/GPU)
+- Python `.pt` (CPU/GPU)
+- ONNX Runtime C++ (CPU/GPU when available)
+- TensorRT C++ (GPU)
+
+### Run benchmark only
+
+```bash
+uv run python src/benchmark.py
+```
+
+Optional flags:
+
+```bash
+uv run python src/benchmark.py --skip-python
+uv run python src/benchmark.py --onnx-dir artifacts/onnx --inference-bin cpp/build/inference --trt-bin cpp/build/trt_inference
+```
+
+### Run full end-to-end pipeline
+
+```bash
+uv run src/pipeline.py
+```
+
+This is the preferred command for reproducible inference validation because it:
+- regenerates data
+- retrains and exports all formats
+- rebuilds C++ binaries
+- runs the unified benchmark
+
+### Why `.pt` LSTM GPU latency is higher than `.pth`
+
+You may observe `Python (.pt)` GPU latency for `NaiveLSTM` and `ImprovedLSTM`
+significantly higher than `Python (.pth)` GPU latency. This is expected.
+
+Reason:
+1. `.pt` exports are trace-based TorchScript modules.
+2. For traced LSTM `.pt`, PyTorch does not expose a usable `flatten_parameters()` method after load.
+3. cuDNN then emits the contiguous-weight warning (`RNN module weights are not part of single contiguous chunk of memory`).
+4. To guarantee warning-free inference, benchmark code disables cuDNN for `.pt` LSTM GPU runs.
+
+Impact:
+- No warning spam during benchmark.
+- Correct outputs are unchanged.
+- LSTM `.pt` GPU latency is higher because those runs use the non-cuDNN path.
+
+Scope:
+- This applies only to Python `.pt` LSTM GPU rows.
+- `.pth` LSTM GPU runs still use cuDNN and remain fast.
+- Transformer and TCN `.pt` GPU rows are not affected.
+
+### CUDA dependency handling for ONNX C++ benchmarks
+
+When `src/benchmark.py` launches C++ binaries, it prepends CUDA library paths
+from the active `uv` environment (`.venv/site-packages/nvidia/*/lib`) to
+`LD_LIBRARY_PATH`. This prevents common ORT CUDA load failures such as:
+- `Failed to load ... libonnxruntime_providers_cuda.so`
+- `libcudnn.so.9: cannot open shared object file`
+
+If you run C++ binaries manually, set `LD_LIBRARY_PATH` yourself.
 
 ---
 
@@ -612,17 +658,20 @@ not abort the entire run.
 |   |-- TCN_loss.png
 |   |-- Transformer_loss.png
 |   `-- onnx
-|       |-- NaiveLSTM.onnx
-|       |-- ImprovedLSTM.onnx
-|       |-- Transformer.onnx
-|       |-- TCN.onnx
+|       |-- NaiveLSTM.{pth,pt,onnx,engine}     <- all four export formats per model
+|       |-- ImprovedLSTM.{pth,pt,onnx,engine}
+|       |-- Transformer.{pth,pt,onnx,engine}
+|       |-- TCN.{pth,pt,onnx,engine}
 |       |-- holdout_input.bin
 |       |-- holdout_target.bin
 |       |-- holdout_meta.json
-|       `-- cpp_metrics.json
+|       |-- cpp_metrics.json                    <- ONNX/ORT C++ results
+|       |-- trt_metrics.json                    <- TensorRT C++ results
+|       `-- python_metrics.json                 <- Python .pth/.pt results
 |-- cpp
 |   |-- CMakeLists.txt
-|   `-- inference.cpp
+|   |-- inference.cpp                           <- ONNX/ORT benchmark binary
+|   `-- trt_inference.cpp                       <- TensorRT benchmark binary
 |-- data
 |   `-- input
 |       |-- data_signals.csv
@@ -633,7 +682,9 @@ not abort the entire run.
     |-- __init__.py
     |-- generate.py
     |-- path.py
-    |-- train.py
+    |-- pipeline.py                             <- end-to-end pipeline runner
+    |-- train.py                                <- trains models, exports all formats
+    |-- benchmark.py                            <- unified 8-row comparison table
     `-- models
         |-- __init__.py
         |-- improved_lstm.py

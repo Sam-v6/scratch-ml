@@ -49,7 +49,13 @@ class ImprovedLSTM(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x:   (B, T, F)
-        out, _ = self.lstm(x)
+        # Explicitly initialise h₀/c₀ with x.new_zeros so the hidden state is
+        # always on the same device as the input (device-agnostic for tracing).
+        B = x.size(0)
+        h0 = x.new_zeros(self.lstm.num_layers, B, self.lstm.hidden_size)
+        c0 = x.new_zeros(self.lstm.num_layers, B, self.lstm.hidden_size)
+        self.lstm.flatten_parameters()  # ensure contiguous weight layout for cuDNN
+        out, _ = self.lstm(x, (h0, c0))
         # out: (B, T, H)  -- hidden state at every timestep
 
         out = self.norm(out)

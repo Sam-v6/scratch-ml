@@ -18,9 +18,11 @@ Outputs written to SCRATCH_HOME/artifacts/onnx/:
 A summary table is also printed to stdout.
 """
 
+import argparse
 import json
 import math
 import os
+import sys
 import time
 
 import matplotlib.pyplot as plt
@@ -340,6 +342,44 @@ def infer_on_dataframe(
 # =============================================================================
 
 
+def export_model_pt_pth(
+    name: str,
+    model: nn.Module,
+    out_dir: str | os.PathLike[str],
+) -> None:
+    """
+    Export the model in two PyTorch native formats:
+      {name}.pth -- raw state dict (torch.save / torch.load + model class)
+      {name}.pt  -- TorchScript traced graph (torch.jit.save / torch.jit.load)
+
+    Both use a static dummy input of shape (1, 256, 3) consistent with the ONNX
+    export.  The model is moved to CPU before tracing so the saved graph is
+    device-agnostic (benchmark.py uses map_location to move it at load time).
+    """
+    original_device = next(model.parameters()).device
+    model.eval()
+    model.cpu()
+
+    dummy = torch.zeros(1, 256, 3)
+
+    # --- state dict (.pth) ---
+    pth_path = os.path.join(out_dir, f"{name}.pth")
+    torch.save(model.state_dict(), pth_path)
+    print(f"  Saved state dict  -> {pth_path}")
+
+    # --- TorchScript (.pt) ---
+    # Keep the .pt export path trace-based for all models. Some PyTorch builds
+    # fail when scripting LSTM internals (torch.nn.modules.rnn flatten logic).
+    # We flatten recurrent weights at load time in benchmark.py before GPU runs.
+    pt_path = os.path.join(out_dir, f"{name}.pt")
+    with torch.no_grad():
+        scripted = torch.jit.trace(model, dummy)
+    torch.jit.save(scripted, pt_path)
+    print(f"  Saved TorchScript -> {pt_path}")
+
+    model.to(original_device)
+
+
 def export_model_onnx(
     name: str,
     model: nn.Module,
@@ -610,7 +650,53 @@ def plot_inference_subplots(results: dict, out_path: str | os.PathLike[str]) -> 
 # =============================================================================
 
 
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Train and export all time-series models")
+    p.add_argument(
+        "--export-only",
+        action="store_true",
+        help=(
+            "Skip training.  Load existing .pth files from artifacts/onnx/ and re-export .pt (TorchScript) and .onnx files.  Useful after changing model forward() methods without needing to retrain."
+        ),
+    )
+    return p.parse_args()
+
+
+def export_only() -> None:
+    """Load trained models from existing .pth files and re-export .pt / .onnx."""
+    onnx_dir = CONFIG["onnx_dir"]
+    if not os.path.isdir(onnx_dir):
+        print(f"ERROR: {onnx_dir} not found -- run training first.")
+        sys.exit(1)
+
+    model_list = [
+        ("NaiveLSTM", NaiveLSTM(input_size=3)),
+        ("ImprovedLSTM", ImprovedLSTM(input_size=3)),
+        ("Transformer", TimeSeriesTransformer(input_size=3)),
+        ("TCN", TCN(input_size=3)),
+    ]
+
+    print(f"\n{'=' * 52}\nExport-only mode (.pth -> .pt / .onnx)")
+    for name, model in model_list:
+        pth_path = os.path.join(onnx_dir, f"{name}.pth")
+        if not os.path.exists(pth_path):
+            print(f"  [SKIP] {name}.pth not found at {pth_path}")
+            continue
+        print(f"\n  {name}")
+        model.load_state_dict(torch.load(pth_path, weights_only=True))
+        model.eval()
+        export_model_pt_pth(name, model, onnx_dir)
+        export_model_onnx(name, model, onnx_dir, CONFIG["onnx_opset"])
+
+    print("\nExport complete.")
+
+
 def main() -> None:
+    args = parse_args()
+    if args.export_only:
+        export_only()
+        return
+
     # Reproducibility
     torch.manual_seed(CONFIG["seed"])
     np.random.seed(CONFIG["seed"])
@@ -688,8 +774,9 @@ def main() -> None:
     if CONFIG["onnx_export_enabled"]:
         onnx_dir = CONFIG["onnx_dir"]
         os.makedirs(onnx_dir, exist_ok=True)
-        print(f"\n{'=' * 52}\nONNX Export")
+        print(f"\n{'=' * 52}\nModel Export (.pth / .pt / .onnx)")
         for cfg in models_cfg:
+            export_model_pt_pth(cfg["name"], cfg["model"], onnx_dir)
             export_model_onnx(cfg["name"], cfg["model"], onnx_dir, CONFIG["onnx_opset"])
 
     if CONFIG["inference_holdout_enabled"]:
