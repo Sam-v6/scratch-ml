@@ -2,8 +2,6 @@
 train.py -- train all four time-series models and produce comparison artifacts
 
 Usage (from repo root):
-    python src/train.py
-    # or
     uv run python src/train.py
 
 Outputs written to SCRATCH_HOME/artifacts/:

@@ -30,13 +30,13 @@ target   = envelope * y_base + noise
 ```
 
 Two things make this hard:
-- **Lag** -- the `triangle_lag5` term means the target depends on the triangle wave from 5 steps ago.
+- **Lag** - the `triangle_lag5` term means the target depends on the triangle wave from 5 steps ago.
   A model that only looks at the current input will consistently miss this.
-- **Slow envelope** -- the amplitude of the relationship changes sinusoidally over time (0.2 Hz),
+- **Slow envelope** - the amplitude of the relationship changes sinusoidally over time (0.2 Hz),
   so the model must track both the fast signals and this slow modulation simultaneously.
 
 **Split:** 60% training (1,200 samples) / 40% validation (800 samples), in temporal order.
-No shuffling -- future data must never influence training.
+No shuffling - future data must never influence training.
 
 ---
 
@@ -100,7 +100,7 @@ LSTM(F=3 -> H=64, 3 layers, dropout=0.1)
 ### 3. Transformer (encoder-only)
 
 **What it does:** Processes all 256 timesteps *in parallel* using multi-head self-attention.
-Every timestep "looks at" every other timestep simultaneously -- no sequential computation.
+Every timestep "looks at" every other timestep simultaneously - no sequential computation.
 
 **Architecture:**
 
@@ -115,7 +115,7 @@ Linear(F=3 -> d=64)              embed each timestep into d_model dimensions
   |  Linear(64 -> 1)
 ```
 
-**Positional encoding** -- because self-attention treats input as an unordered *set*, we must
+**Positional encoding** - because self-attention treats input as an unordered *set*, we must
 explicitly encode each position.  We use the sinusoidal formula from "Attention is All You Need"
 (Vaswani et al., 2017):
 
@@ -127,13 +127,13 @@ PE(pos, 2i+1) = cos(pos / 10000^(2i/64))
 These fixed sinusoids are added to the input embeddings before attention, giving the model a
 unique "fingerprint" for each position without requiring any learned parameters.
 
-**Multi-head attention** -- 8 attention heads each compute attention over an 8-dimensional
+**Multi-head attention** - 8 attention heads each compute attention over an 8-dimensional
 subspace in parallel, then concatenate their outputs.  This lets the model attend to different
 aspects of the sequence simultaneously.
 
 ---
 
-### 4. TCN -- Temporal Convolutional Network
+### 4. TCN - Temporal Convolutional Network
 
 **What it does:** Uses 1-D convolutions instead of recurrence or attention.  The key innovations
 are *causal* and *dilated* convolutions stacked in a residual network.
@@ -153,19 +153,19 @@ From "An Empirical Evaluation of Generic Convolutional and Recurrent Networks fo
   |  Linear(64 -> 1)
 ```
 
-**Causal convolution** -- a regular `Conv1d` with `padding=p` pads both sides, so the output at
-time *t* can depend on inputs at time *t+1, t+2, ...* -- this leaks the future.  We fix this by
+**Causal convolution** - a regular `Conv1d` with `padding=p` pads both sides, so the output at
+time *t* can depend on inputs at time *t+1, t+2, ...* - this leaks the future.  We fix this by
 setting `padding=0` and manually left-padding only:
 
 ```python
 F.pad(x, (pad, 0))   # pad on the left; nothing on the right
 ```
 
-**Dilated convolution** -- with dilation *d* and kernel size *k*, the filter reads positions
+**Dilated convolution** - with dilation *d* and kernel size *k*, the filter reads positions
 *t*, *t-d*, *t-2d*, ..., *t-(k-1)d*.  A kernel of size 3 with dilation 32 covers timesteps
 that are 64 steps apart, giving a wide receptive field without extra parameters.
 
-**Receptive field** -- stacking 6 blocks with dilation 1, 2, 4, 8, 16, 32 and kernel size 3:
+**Receptive field** - stacking 6 blocks with dilation 1, 2, 4, 8, 16, 32 and kernel size 3:
 
 ```
 total = (1+2+4+8+16+32) * (3-1) = 63 * 2 = 126 timesteps
@@ -173,7 +173,7 @@ total = (1+2+4+8+16+32) * (3-1) = 63 * 2 = 126 timesteps
 
 This comfortably covers our 256-step lookback window.
 
-**Weight normalisation** -- decouples the weight's *magnitude* from its *direction*
+**Weight normalisation** - decouples the weight's *magnitude* from its *direction*
 (`w = g * v/||v||`), which can stabilise training compared to plain batch norm.
 
 ---
@@ -193,31 +193,39 @@ The configuration lives in `pyproject.toml` under `[tool.ruff]`.
 | isort                | `I` | Import ordering: stdlib first, then third-party, then first-party |
 | pyupgrade            | `UP`| Modern Python syntax (e.g. `list[int]` instead of `List[int]`) |
 | flake8-bugbear       | `B` | Common bugs and design issues (e.g. mutable default args) |
+| flake8-annotations   | `ANN` | Type annotation coverage rules |
 
 **Ignored rules** (documented in `pyproject.toml`):
 
 | Code | Reason ignored |
 |------|----------------|
-| `E221` | Multiple spaces before operator -- allowed for vertical alignment of related assignments |
-| `E241` | Multiple spaces after comma -- same reason |
+| `E221` | Multiple spaces before operator - allowed for vertical alignment of related assignments |
+| `E241` | Multiple spaces after comma - same reason |
+| `E203` | Whitespace before `:` in slices (kept compatible with Black-style formatting) |
+| `E501` | Line length handled separately (`line-length = 200`) |
+
+**Additional Ruff config:**
+- `line-length = 200`
+- `target-version = "py312"`
+- `exclude = ["*.ipynb"]`
 
 ### Running ruff manually
 
 ```bash
 # Lint
-uv run ruff check src/models src/train.py src/path.py
+uv run ruff check src
 
 # Auto-fix lint issues where possible
-uv run ruff check --fix src/models src/train.py src/path.py
+uv run ruff check --fix src
 
 # Format
-uv run ruff format src/models src/train.py src/path.py
+uv run ruff format src
 ```
 
 ### Pre-commit hook
 
-A git pre-commit hook at `.git/hooks/pre-commit` runs both checks automatically before every
-commit.  It will reject the commit if any lint or formatting issue is found.
+Pre-commit hooks are configured in `.pre-commit-config.yaml` and run Ruff lint/format checks
+before commit once installed.
 
 ```bash
 # Run this to setup the pre-commit hook the first time
@@ -228,7 +236,40 @@ uv run pre-commit install
 
 ## How to Run
 
-**Install dependencies** (requires [uv](https://github.com/astral-sh/uv)):
+### Install `uv` (one-time local setup)
+
+`uv` is required for dependency management and running commands in this project.
+
+macOS / Linux:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+Alternative install method:
+
+```bash
+pipx install uv
+```
+
+Verify installation:
+
+```bash
+uv --version
+```
+
+For additional install options, see the official docs:
+https://docs.astral.sh/uv/getting-started/installation/
+
+### Project setup
+
+**Install dependencies**:
 
 ```bash
 uv sync
@@ -240,7 +281,7 @@ uv sync
 uv sync --group dev
 ```
 
-**Regenerate the synthetic data** (optional -- data is already committed):
+**Regenerate the synthetic data** (optional - data is already committed):
 
 ```bash
 uv run python src/generate.py
@@ -263,18 +304,22 @@ All hyperparameters are in the `CONFIG` dict at the top of `src/train.py`.
 ---
 
 ## Results
-Model                  Params  Best Val RMSE  Train Time (s)  Epochs
---------------------------------------------------------------------
-NaiveLSTM              13,217         0.2821             3.9     100
-ImprovedLSTM           84,481         0.2919             5.5     100
-Transformer           150,273         0.2781            16.0     100
-TCN                   137,601         0.2815             9.1     100
+
+Latest committed run (100 epochs):
+
+| Model | Params | Best Val RMSE | Train Time (s) | Epochs |
+|-------|-------:|--------------:|---------------:|-------:|
+| NaiveLSTM | 13,217 | 0.2821 | 3.9 | 100 |
+| ImprovedLSTM | 84,481 | 0.2919 | 5.5 | 100 |
+| Transformer | 150,273 | 0.2781 | 16.0 | 100 |
+| TCN | 137,601 | 0.2815 | 9.1 | 100 |
 
 ---
 
 ## Repository Structure
 
-```
+```text
+❯ lt
 ├──  artifacts
 │  ├──  comparison.png
 │  ├──  ImprovedLSTM_loss.png
@@ -290,12 +335,6 @@ TCN                   137,601         0.2815             9.1     100
 │  └──  explore.ipynb
 ├──  pyproject.toml
 ├──  README.md
-├──  scratch_ml.egg-info
-│  ├──  dependency_links.txt
-│  ├──  PKG-INFO
-│  ├──  requires.txt
-│  ├──  SOURCES.txt
-│  └──  top_level.txt
 ├──  src
 │  ├──  __init__.py
 │  ├──  __pycache__
@@ -307,7 +346,6 @@ TCN                   137,601         0.2815             9.1     100
 │  │  ├──  tcn.cpython-312.pyc
 │  │  └──  transformer.cpython-312.pyc
 │  ├──  generate.py
-│  ├──  improved_lstm.py
 │  ├──  models
 │  │  ├──  __init__.py
 │  │  ├──  __pycache__
@@ -320,11 +358,9 @@ TCN                   137,601         0.2815             9.1     100
 │  │  ├──  naive_lstm.py
 │  │  ├──  tcn.py
 │  │  └──  transformer.py
-│  ├──  naive_lstm.py
 │  ├──  path.py
-│  ├──  tcn.py
-│  ├──  train.py
-│  └──  transformer.py
-├──  TODO.md
+│  └──  train.py
 └──  uv.lock
 ```
+
+Note: this tree uses plain ASCII to render reliably in Markdown preview. If you use `lt`/`lsd`, disable icons before pasting output into docs.
