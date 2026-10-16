@@ -72,6 +72,14 @@ A follow-up ran the same pinned Timestral-5M weights on an Intel Core i9-14900K 
 
 After warmup, three passes over all 400 windows at batch size 16 took 4.483, 4.131, and 4.467 seconds (median **4.47 seconds**). Twenty separate batch-size-one calls had median latency **24.2 ms**, with a 24.7 ms 95th percentile. These calls repeated the first test window; this is a small local latency measurement rather than a general hardware benchmark. Loading and warmup are excluded. The runtime was explicitly verified to use CPU parameters.
 
+To repeat this CPU-only protocol without retraining the baselines:
+
+```bash
+uv run --extra timestral --frozen python src/benchmark_timestral_cpu.py
+```
+
+Run the main comparison once first to cache the 5M weights. The CPU script loads those weights offline, compares against the committed GPU predictions, and writes its new receipt and predictions under `artifacts/timestral-cpu/`.
+
 The [CPU measurement receipt](cpu/run.json) and [CPU predictions](cpu/predictions.csv) preserve the result. The distribution consists of `config.json` plus `model.safetensors`, loaded by the official Python/PyTorch implementation. This integration does not export Timestral to ONNX or a standalone executable.
 
 ## Sources
