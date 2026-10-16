@@ -30,6 +30,12 @@ dependencies = [
     "torchvision>=0.23.0",
 ]
 
+[project.optional-dependencies]
+timestral = [
+    "timestral @ git+https://github.com/mistralai/timestral.git@a534bdbd244d64f3d9d743f46c7bf6fc330ed4ff",
+    "huggingface_hub==0.36.0",
+]
+
 [dependency-groups]
 dev = ["ruff>=0.9.0"]
 
