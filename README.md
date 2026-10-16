@@ -4,6 +4,17 @@ A learning project for comparing four deep learning architectures on a time-seri
 The goal is to understand the tradeoffs between LSTMs, Transformers, and convolutional networks by
 implementing each one from scratch, training them under identical conditions, and comparing the results.
 
+## Timestral comparison
+
+A separate GPU benchmark compares the four existing architectures against local, zero-shot
+Timestral 5M/28M/209M and persistence baselines on a shared next-step forecasting task.
+See [results, plots, methodology, and run commands](docs/timestral/README.md).
+
+```bash
+uv sync --extra timestral --frozen
+uv run --extra timestral --frozen python src/compare_timestral.py --device cuda
+```
+
 ---
 
 ## The Data
