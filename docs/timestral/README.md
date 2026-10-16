@@ -66,6 +66,14 @@ The trained baselines are much smaller (13k–150k parameters) than Timestral (5
 
 Limits: one synthetic realization, one training seed, one short test segment, overlapping contexts, and no significance estimates. The original generator rescales each complete signal with full-series minimum/maximum before this benchmark reads it; this pre-existing property limits strict deployment realism even though benchmark standardization is train-only. This is not evidence of real-world sensor generalization, multi-step performance, or an exhaustively tuned baseline ranking. Foundation-model pretraining exposure cannot be independently audited here.
 
+## Small model on CPU
+
+A follow-up ran the same pinned Timestral-5M weights on an Intel Core i9-14900K with four PyTorch threads, using the same 400 test windows and sensor covariates. CPU RMSE was **0.24045 V** (MAE 0.17287 V); the largest median-prediction difference from GPU was 0.00000314 V.
+
+After warmup, three passes over all 400 windows at batch size 16 took 4.483, 4.131, and 4.467 seconds (median **4.47 seconds**). Twenty separate batch-size-one calls had median latency **24.2 ms**, with a 24.7 ms 95th percentile. These calls repeated the first test window; this is a small local latency measurement rather than a general hardware benchmark. Loading and warmup are excluded. The runtime was explicitly verified to use CPU parameters.
+
+The [CPU measurement receipt](cpu/run.json) and [CPU predictions](cpu/predictions.csv) preserve the result. The distribution consists of `config.json` plus `model.safetensors`, loaded by the official Python/PyTorch implementation. This integration does not export Timestral to ONNX or a standalone executable.
+
 ## Sources
 
 - [Mistral announcement](https://mistral.ai/news/timestral/)

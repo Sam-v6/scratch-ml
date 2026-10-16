@@ -1,0 +1,23 @@
+{
+  "device": "cpu",
+  "cpu": "x86_64",
+  "threads": 4,
+  "model": "Timestral-5M",
+  "revision": "bdd20cfc15a3fea0e4cb5ccef37f8d3ca7aa335f",
+  "windows": 400,
+  "lookback": 256,
+  "horizon": 1,
+  "rmse": 0.24045079946517944,
+  "mae": 0.17287389934062958,
+  "load_seconds": 0.05003563401987776,
+  "batch_size": 16,
+  "total_inference_seconds": [
+    4.482590031024301,
+    4.130692056991393,
+    4.467469309020089
+  ],
+  "median_total_seconds": 4.467469309020089,
+  "single_forecast_median_ms": 24.210207993746735,
+  "single_forecast_p95_ms": 24.695696352864616,
+  "max_abs_difference_from_gpu": 3.133911132824352e-06
+}
