@@ -54,6 +54,9 @@ class ForecastTests(unittest.TestCase):
         np.testing.assert_array_equal(calls[0][1]["past_covariates"], x[:, :, :3].transpose(0, 2, 1))
         self.assertEqual(calls[0][1]["prediction_length"], 1)
         self.assertNotIn("known_covariates", calls[0][1])
+        self.assertTrue(calls[0][1].get("symmetric_averaging", True))
+        forecast_timestral(Recorder(), x, symmetric_averaging=False)
+        self.assertFalse(calls[1][1]["symmetric_averaging"])
         np.testing.assert_allclose(result, [[0.1, 0.5, 0.9]] * 2)
 
 
