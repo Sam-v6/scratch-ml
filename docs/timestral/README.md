@@ -82,6 +82,8 @@ Run the main comparison once first to cache the 5M weights. The CPU script loads
 
 The [CPU measurement receipt](cpu/run.json) and [CPU predictions](cpu/predictions.csv) preserve the result. The distribution consists of `config.json` plus `model.safetensors`, loaded by the official Python/PyTorch implementation. This integration does not export Timestral to ONNX or a standalone executable.
 
+See the [CPU latency investigation](cpu-latency/README.md) for an opt-in compiled single-pass configuration measured below 10 ms at p95, with its accuracy tradeoff.
+
 ## Sources
 
 - [Mistral announcement](https://mistral.ai/news/timestral/)

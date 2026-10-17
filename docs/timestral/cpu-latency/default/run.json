@@ -1,0 +1,44 @@
+{
+  "model": "Timestral-5M",
+  "revision": "bdd20cfc15a3fea0e4cb5ccef37f8d3ca7aa335f",
+  "device": "cpu",
+  "cpu": "x86_64",
+  "torch_version": "2.8.0+cu128",
+  "threads": 4,
+  "compiled": false,
+  "symmetric_averaging": true,
+  "lookback": 256,
+  "horizon": 1,
+  "batch_size": 1,
+  "windows": 400,
+  "repeats": 3,
+  "timed_calls": 1200,
+  "data_sha256": "cc12c994a0fad3cdf62802db4f7c3fe8c940364c01d7edde0c573440cf9657bb",
+  "first_call_seconds": 0.02574162499513477,
+  "median_ms": 23.1498085,
+  "p95_ms": 23.67984615,
+  "p99_ms": 24.360447999999998,
+  "max_ms": 25.345699,
+  "fraction_under_10ms": 0.0,
+  "rmse": 0.24045081436634064,
+  "mae": 0.17287389934062958,
+  "coverage_80": 0.8275,
+  "max_abs_difference_from_default_gpu": 5.518096923839977e-06,
+  "per_repeat": [
+    {
+      "repeat": 0,
+      "median_ms": 23.1954795,
+      "p95_ms": 23.679195399999998
+    },
+    {
+      "repeat": 1,
+      "median_ms": 23.135783,
+      "p95_ms": 23.67289405
+    },
+    {
+      "repeat": 2,
+      "median_ms": 23.125358,
+      "p95_ms": 23.7058717
+    }
+  ]
+}
